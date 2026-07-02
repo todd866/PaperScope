@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperscope"
+description = "Toolkit for writing and reviewing academic papers. Semantic analysis, forensic statistics (19 data-integrity checks), critical read, and bibliography management."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Ian Todd", email = "ian@coherencedynamics.com" }]
+keywords = ["academic", "papers", "citations", "latex", "embedding", "analysis"]
+# Floor is 3.9: PEP 604/585 annotations are guarded by future imports and the
+# full suite passes on 3.9 (scipy>=1.11 already requires >=3.9).
+requires-python = ">=3.9"
+# version single-sourced from paperscope/__init__.py; dependencies from
+# requirements.txt (which stays the source of truth — edit deps there).
+dynamic = ["version", "dependencies"]
+
+[project.scripts]
+paperscope = "paperscope.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/todd866/PaperScope"
+Repository = "https://github.com/todd866/PaperScope"
+
+[tool.setuptools.dynamic]
+version = { attr = "paperscope.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["paperscope*"]

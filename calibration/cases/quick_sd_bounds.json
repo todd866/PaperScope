@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "label": "quick SD check: a valid SD within bounds must PASS (must_pass) vs an SD exceeding the n-aware maximum (must_detect)",
+    "source": "synthetic",
+    "ground_truth": "synthetic: constructed against the maximum achievable sample SD. For data confined to [1, 7] at n=30, the largest possible sample SD (half the points at each extreme) is (range/2)*sqrt(floor(n/2)*ceil(n/2)/(n*(n-1))) = 3.05. An SD of 2.5 sits comfortably inside that bound and is possible; an SD of 3.5 exceeds 3.05 even after allowing a full half-ulp of rounding, so it is impossible for any dataset that stays within the stated range.",
+    "notes": "Neutral, non-biological (a bounded wellbeing index). The scale declares lo/hi (bounds) but NO granularity, so GRIM is correctly skipped as UNDETERMINED (a continuous index is not integer-granular) and only quick_sd_check is asserted. The valid SD (2.5) is the specificity guard and the over-range SD (3.5) the sensitivity target. Note: a reported SD sitting exactly AT the n-aware maximum (a heavily bimodal dataset) legitimately draws the softer bimodality FLAG rather than a clean PASS, so the specificity guard uses a mid-range SD; the exact rounded-true-max anti-false-accusation (real dataset [1,1,7,7] -> '3.5' at n=4) is locked in by the unit regression test. This case locks in bug-1 (quick_sd rounding tolerance + n-aware bound)."
+  },
+  "table": {
+    "meta": {"paper": "Bounded index SDs (SYNTHETIC)", "table": "Table 1. Mean and SD of a 1-7 index."},
+    "scale": {"lo": 1, "hi": 7},
+    "variables": [
+      {
+        "name": "Wellbeing index",
+        "groups": [
+          {"name": "valid", "n": 30, "sd": "2.5"},
+          {"name": "impossible", "n": 30, "sd": "3.5"}
+        ]
+      }
+    ]
+  },
+  "text": null,
+  "expected": {
+    "must_detect": [
+      {"check": "quick_sd_check", "target_contains": "Wellbeing index / impossible", "min_verdict": "FAIL"}
+    ],
+    "must_pass": [
+      {"check": "quick_sd_check", "target_contains": "Wellbeing index / valid"}
+    ]
+  }
+}

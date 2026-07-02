@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "label": "GRIM: impossible vs valid group mean (7-item survey score)",
+    "source": "synthetic",
+    "ground_truth": "synthetic: error planted by construction. A mean of a sum of 7 integer item-scores, reported to 2 dp, must satisfy GRIM: mean x n must land within half a display-ulp of an integer. 4.63 x 7 = 32.41 (nearest achievable 4.5714 / 4.7143) is impossible; 4.57 x 7 = 31.99 rounds to the integer sum 32 and is valid.",
+    "notes": "Neutral, non-biological. Two groups (treatment / control) in one variable so one GRIM must FAIL while the other must PASS in the SAME table -- sensitivity and specificity together. The variable declares granularity 1 (each respondent's composite is an integer item-sum) so GRIM applies; without it the runner would (correctly) skip a possibly-continuous measure as UNDETERMINED. 4.63 also fails under truncation ([4.63, 4.64) contains no achievable mean), so it is a robust FAIL, not a convention-dependent FLAG."
+  },
+  "table": {
+    "meta": {"paper": "Effect of prompt wording on a 7-item usability survey (SYNTHETIC)", "table": "Table 1. Mean composite score by condition."},
+    "variables": [
+      {
+        "name": "Composite score",
+        "granularity": 1,
+        "groups": [
+          {"name": "treatment", "n": 7, "mean": "4.63"},
+          {"name": "control", "n": 7, "mean": "4.57"}
+        ]
+      }
+    ]
+  },
+  "text": null,
+  "expected": {
+    "must_detect": [
+      {"check": "grim", "target_contains": "treatment", "min_verdict": "FAIL"}
+    ],
+    "must_pass": [
+      {"check": "grim", "target_contains": "control"}
+    ]
+  }
+}

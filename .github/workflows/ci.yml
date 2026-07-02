@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  public-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --history scans every blob reachable from HEAD; needs full clone.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PDF text extractor
+        run: pip install PyMuPDF
+
+      - name: Public-safety scan (tip)
+        run: python scripts/check_public_safe.py
+
+      - name: Public-safety scan (full history)
+        run: python scripts/check_public_safe.py --history
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the declared floor (requires-python in pyproject.toml).
+        python-version: ["3.9", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The OCR-gated tests in test_shadow_content_verify.py skip without
+      # tesseract; install it so they actually run.
+      - name: Install tesseract
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Byte-compile package
+        run: python -m compileall -q paperscope
+
+      - name: Import-all smoke
+        run: |
+          python - <<'EOF'
+          import importlib
+          import pkgutil
+
+          import paperscope
+
+          failures = []
+          for mod in pkgutil.walk_packages(paperscope.__path__, "paperscope."):
+              try:
+                  importlib.import_module(mod.name)
+              except Exception as exc:  # noqa: BLE001 — report every import failure
+                  failures.append(f"{mod.name}: {exc!r}")
+          if failures:
+              raise SystemExit("import-all failed:\n" + "\n".join(failures))
+          print("import-all: OK")
+          EOF
+
+      - name: Run tests
+        # tests/test_systematic_review.py skips itself when PAPERSCOPE_SR_CORPUS
+        # is unset (it always is in CI) — that skip is expected.
+        run: python -m pytest tests/ -q
+
+      - name: Packaging smoke (editable install + entry point)
+        run: |
+          pip install -e .
+          paperscope --help

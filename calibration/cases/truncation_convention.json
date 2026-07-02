@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "label": "Truncation convention: a round-down-only mean is not impossible (must_pass) vs a robust GRIM failure (must_detect)",
+    "source": "synthetic",
+    "ground_truth": "synthetic: constructed by rounding convention. Reported means are rounded, and papers use EITHER round-half (nearest) OR truncation (round-down) — Brown & Heathers (2017). A mean is impossible only when NO plausible convention produces it. Composite score, n=16, sum 83 -> 5.1875 truncates to '5.18' (round-half would print '5.19'): achievable under truncation, so NOT impossible. Composite score, n=22, '18.75' -> 412.5 lands between the achievable 18.7273 and 18.7727 and no integer sum falls in [18.75, 18.76), so it is impossible under BOTH conventions.",
+    "notes": "Neutral, non-biological (an integer item-sum composite). The variable declares granularity 1 so GRIM applies. The truncation-consistent mean (5.18) is the specificity guard: branding it impossible would require assuming the paper round-halved — the cardinal rule forbids a convention-dependent accusation, so it must PASS under the default convention='both'. The robust-impossible mean (18.75) fails under both conventions and must FAIL. This locks in bug-9 (truncation convention)."
+  },
+  "table": {
+    "meta": {"paper": "Composite item-sum by rounding convention (SYNTHETIC)", "table": "Table 1. Mean composite score."},
+    "variables": [
+      {
+        "name": "Composite score",
+        "granularity": 1,
+        "groups": [
+          {"name": "truncated", "n": 16, "mean": "5.18"},
+          {"name": "impossible", "n": 22, "mean": "18.75"}
+        ]
+      }
+    ]
+  },
+  "text": null,
+  "expected": {
+    "must_detect": [
+      {"check": "grim", "target_contains": "Composite score / impossible", "min_verdict": "FAIL"}
+    ],
+    "must_pass": [
+      {"check": "grim", "target_contains": "Composite score / truncated"}
+    ]
+  }
+}

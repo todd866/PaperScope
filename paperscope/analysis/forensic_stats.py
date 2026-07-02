@@ -1,0 +1,2352 @@
+#!/usr/bin/env python3
+"""
+Forensic statistics checker for peer review.
+
+Implements the data-integrity tests used by statistical sleuths
+(Meyerowitz-Katz, Brown/Heathers GRIM, etc.) to detect impossible
+or implausible summary statistics in published papers.
+
+Usage:
+    Import the check functions and feed in extracted table data:
+
+    from paperscope.analysis.forensic_stats import (
+        grim, grim_column, grim_row,
+        grimmer, grim_percentage, sprite, correlation_bound,
+        check_ttest_paired, check_ttest_independent,
+        check_anova_oneway, check_chi_squared,
+        sample_size_from_t, effect_size_consistency,
+        carlisle_stouffer_fisher, check_sd_se_confusion,
+        quick_sd_check, check_contingency_table,
+        benfords_law, variance_ratio_test,
+        check_change_arithmetic, check_sd_positive,
+        check_frozen_sds, infer_column_dp,
+    )
+
+Verdict semantics (cardinal rule of a forensic tool): NEVER brand possible
+data impossible.  When a check cannot be computed (degenerate or invalid
+input), the verdict is "undetermined / cannot test" — never FAIL.
+
+References:
+    Heathers (2025) "An Introduction to Forensic Metascience" doi:10.5281/zenodo.14871843
+    Brown & Heathers (2017) "The GRIM Test" doi:10.1177/1948550616673876
+    Anaya (2016) "The GRIMMER Test" doi:10.7287/peerj.preprints.2400v1
+    Jane (2024) matthewbjane.github.io/blog-posts/blog-post-1.html
+    Heathers, Anaya, van der Zee & Brown (2018) "SPRITE" doi:10.7287/peerj.preprints.26968v1
+    Carlisle (2017) doi:10.1111/anae.13938
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import warnings
+from collections import Counter
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
+
+from scipy import stats as sp
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 0. HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _dp_from_str(s: str) -> int:
+    """Extract decimal places from a string representation of a number."""
+    s = s.strip()
+    if '.' in s:
+        return len(s.split('.')[-1])
+    return 0
+
+
+def _p_half_ulp(p: Union[str, float, int]) -> float:
+    """Half a unit of the last printed digit of a reported p-value.
+
+    Handles the printed forms _dp_from_str cannot:
+      - scientific notation ('1e-05' -> 5e-6): the effective dp is the
+        mantissa's dp minus the exponent;
+      - bare integers ('1', '0'): Table-1 shorthand for a p printed without
+        decimals — treated as the conventional 2-dp table precision
+        (half-ulp 0.005), NOT 0 dp (whose half-ulp of 0.5 would collapse
+        any p to 0.5 when used as a clamp).
+    Plain decimals ('0.03', '1.00') behave exactly as before.
+    """
+    s = (p if isinstance(p, str) else f"{p}").strip().lower()
+    if 'e' in s:
+        try:
+            mantissa, exponent = s.split('e', 1)
+            dp = max(0, _dp_from_str(mantissa) - int(exponent))
+        except ValueError:
+            dp = 2
+    elif '.' in s:
+        dp = _dp_from_str(s)
+    else:
+        dp = 2  # bare integer: assume >= 2-dp table convention
+    return 0.5 * (10.0 ** -dp)
+
+
+def _truncation_interval(reported: float, ulp: float
+                         ) -> Tuple[float, float, bool, bool]:
+    """The interval of true values whose toward-zero truncation prints as
+    `reported`, as (lo, hi, lo_inclusive, hi_inclusive).
+
+    Truncation means digits past the last printed place are DROPPED — i.e.
+    rounding *toward zero*, not flooring.  The preimage is therefore
+    sign-dependent:
+
+      reported > 0:  x in [reported, reported + ulp)
+      reported < 0:  x in (reported - ulp, reported]   (mirrored: dropping
+                     digits from a negative moves it toward zero, so e.g.
+                     trunc(-5.1875, 2dp) = -5.18)
+      reported == 0: both signs truncate to zero -> x in (-ulp, +ulp)
+    """
+    if reported > 0:
+        return reported, reported + ulp, True, False
+    if reported < 0:
+        return reported - ulp, reported, False, True
+    return -ulp, ulp, False, False
+
+
+def _truncation_consistent(true_val: float, reported: float, ulp: float,
+                           eps: float = 1e-9) -> bool:
+    """Is `true_val` inside the toward-zero truncation preimage of `reported`?
+
+    Inclusive bounds are padded by `eps` (float noise); strict bounds are
+    tightened by `eps` (a value exactly at an open bound displays as the
+    neighbouring printed value).
+    """
+    lo, hi, lo_inc, hi_inc = _truncation_interval(reported, ulp)
+    lo_ok = true_val >= lo - eps if lo_inc else true_val > lo + eps
+    hi_ok = true_val <= hi + eps if hi_inc else true_val < hi - eps
+    return lo_ok and hi_ok
+
+
+def infer_column_dp(values: List[Union[str, float]]) -> int:
+    """
+    Infer the decimal-place precision for a column of reported values.
+
+    Papers often drop trailing zeros (e.g., "26.9" when other values in the
+    same column are reported to 2 dp like "11.26").  The correct dp for GRIM
+    is the *maximum* across the column, because the trailing zero was merely
+    suppressed in display.
+
+    Accepts strings (preferred — preserves trailing zeros like "26.90") or
+    floats (trailing zeros lost by Python's float representation).
+
+    Ref: Gideon Meyerowitz-Katz.
+    """
+    max_dp = 0
+    for v in values:
+        s = v if isinstance(v, str) else f"{v}"
+        max_dp = max(max_dp, _dp_from_str(s))
+    return max_dp
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. GRIM (Granularity-Related Inconsistency of Means)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def grim(mean: Union[str, float], n: int, scale: int = 1,
+         dp: Optional[int] = None, convention: str = "both") -> dict:
+    """
+    GRIM test: is this mean possible for n integer-valued observations?
+
+    Rounding convention (Brown & Heathers 2017): reported means are
+    rounded, and papers use *either* round-half (nearest) *or* truncation
+    (round-down).  A mean is "impossible" only when NO plausible convention
+    can produce it, so before declaring a FAIL we test BOTH:
+
+      - achievable under round-half → PASS (the standard case);
+      - achievable under truncation only → PASS as well (default "both"
+        convention), with a transparency note that it is inconsistent with
+        round-half; `possible` stays True (NOT impossible — never a FAIL,
+        and never a bare FLAG a downstream reader could read as an
+        accusation);
+      - achievable under NEITHER → FAIL (a genuine, robust
+        integer-granularity impossibility).
+
+    The accepted true-mean interval is round-half's ±0.5 ulp unioned with
+    the toward-zero truncation preimage: [reported, reported + ulp) for a
+    non-negative mean, (reported − ulp, reported] for a negative one
+    (truncation drops digits toward zero — see _truncation_interval).
+
+    Args:
+        mean:  reported mean.  Pass as a *string* (e.g., "26.90") to
+               preserve trailing zeros and get correct dp inference.
+               Float input works but may lose trailing-zero precision.
+        n:     sample size
+        scale: granularity of the instrument (1 for integers, 0.5 for
+               half-points, etc.)
+        dp:    decimal places reported.  If None, inferred from `mean`:
+               - string "26.90" → dp=2
+               - float 26.9 → dp=1 (trailing zero lost!)
+               Prefer passing strings or explicit dp for safety.
+        convention: "both" (default — PASS if achievable under round-half OR
+               truncation), "round" (strict nearest-rounding; truncation-only
+               → FAIL, used when the paper is known to round-half), or
+               "truncate" (the paper is known to truncate; same acceptance as
+               "both").
+
+    Returns:
+        dict with 'possible' (bool), 'implied_sum', 'nearest_achievable',
+        'convention', 'round_half_consistent', 'truncation_consistent', and
+        'detail' (str).
+    """
+    if isinstance(mean, str):
+        if dp is None:
+            dp = _dp_from_str(mean)
+        mean = float(mean)
+    elif dp is None:
+        dp = _dp_from_str(f"{mean}")
+    if n <= 0:
+        return {
+            'possible': None,
+            'reported_mean': mean,
+            'n': n,
+            'detail': f"UNDETERMINED: invalid sample size n={n} — cannot test",
+        }
+    implied_sum = mean * n
+    granularity = scale
+
+    # Round-half: the true mean can sit up to half a unit of the last
+    # reported decimal place away.  The boundary is *inclusive* (a true
+    # mean exactly 0.5 ulp away still rounds to the reported value under
+    # half-up or banker's rounding), padded with a small epsilon for float
+    # noise.  Truncation (round-down): the true mean lies in [reported,
+    # reported + ulp) — a strict upper bound (a mean exactly reported+ulp
+    # would display as the next value up).
+    half_ulp = 0.5 * (10 ** -dp)
+    ulp = 10 ** -dp
+    eps = 1e-9
+
+    lower = math.floor(implied_sum / granularity) * granularity / n
+    upper = math.ceil(implied_sum / granularity) * granularity / n
+
+    def _round_ok(m):
+        return abs(m - mean) <= half_ulp + eps
+
+    def _trunc_ok(m):
+        # Toward-zero truncation: sign-aware preimage (see
+        # _truncation_interval) — for a negative reported mean the true
+        # mean lies BELOW it, e.g. -83/16 = -5.1875 truncates to '-5.18'.
+        return _truncation_consistent(m, mean, ulp, eps)
+
+    round_consistent = _round_ok(lower) or _round_ok(upper)
+    trunc_consistent = _trunc_ok(lower) or _trunc_ok(upper)
+
+    # Cardinal rule: a mean is "impossible" only when NO plausible rounding
+    # convention can produce it.  Brown & Heathers (2017) accept EITHER
+    # round-half OR truncation, so the default ("both") passes a mean that
+    # is achievable under either — a truncation-only-consistent mean is NOT
+    # impossible, merely convention-dependent, so it PASSES (never a FAIL and
+    # never a FLAG that a downstream reader could collapse into "impossible";
+    # `possible` stays True so direct consumers of the field cannot mistake
+    # it for an accusation).  Only the strict "round" convention (the paper
+    # is known to round-half) treats truncation-only as a FAIL.
+    trunc_accepted = convention in ("both", "truncate")
+    if convention == "round":
+        possible = round_consistent
+    else:  # "both" (default) or "truncate": either convention passes
+        possible = round_consistent or trunc_consistent
+
+    result = {
+        'possible': possible,
+        'reported_mean': mean,
+        'n': n,
+        'implied_sum': round(implied_sum, dp + 2),
+        'nearest_achievable': [round(lower, dp + 2), round(upper, dp + 2)],
+        'convention': convention,
+        'round_half_consistent': round_consistent,
+        'truncation_consistent': trunc_consistent,
+    }
+    if possible:
+        if round_consistent:
+            result['detail'] = f"PASS: mean {mean} is achievable with n={n}"
+        else:
+            # Truncation-only: achievable, but flag the convention dependence
+            # as a transparency note inside a PASS (never an accusation).
+            result['detail'] = (
+                f"PASS: mean {mean} is achievable with n={n} under truncation "
+                f"(round-down); inconsistent with round-half rounding "
+                f"(nearest achievable {lower:.{dp+2}f}/{upper:.{dp+2}f}) but "
+                f"not impossible"
+            )
+    else:
+        tried = ("round-half and truncation" if trunc_accepted
+                 else "round-half")
+        result['detail'] = (
+            f"FAIL: mean {mean} x n={n} = {implied_sum:.4f}; nearest achievable "
+            f"means are {lower:.{dp+2}f} and {upper:.{dp+2}f} — impossible for "
+            f"integer-granular data at n={n} under {tried} rounding"
+        )
+    return result
+
+
+def grim_column(means: List[Union[str, float]], ns: List[int],
+                labels: Optional[List[str]] = None,
+                scale: int = 1) -> List[dict]:
+    """
+    Run GRIM on a column of means with automatic column-level dp inference.
+
+    The dp is inferred from the *maximum* across all means in the column,
+    because papers often drop trailing zeros (e.g., "26.9" when the column
+    also contains "11.26", implying the real value is "26.90").
+
+    Args:
+        means:  list of reported means (strings preferred for dp safety)
+        ns:     list of sample sizes (one per mean, or a single int for all)
+        labels: optional labels for each mean
+        scale:  instrument granularity (1 for integers)
+
+    Returns:
+        list of grim() result dicts, each with an added 'label' key.
+    """
+    dp = infer_column_dp(means)
+
+    if isinstance(ns, int):
+        ns = [ns] * len(means)
+    if labels is None:
+        labels = [None] * len(means)
+
+    results = []
+    for mean, n, label in zip(means, ns, labels):
+        r = grim(mean, n, scale=scale, dp=dp)
+        r['column_dp'] = dp
+        if label:
+            r['label'] = label
+        results.append(r)
+    return results
+
+
+def grim_row(baseline: Union[str, float], end: Union[str, float],
+             change: Union[str, float], n: int,
+             scale: int = 1, label: str = "") -> dict:
+    """
+    Cross-cell GRIM: check baseline, end, and change with precision
+    constraints enforced across the row.
+
+    When a table reports baseline, end, and change in the same row,
+    the precision of each value constrains the others.  For example,
+    if end=11.26 (2dp) and change=15.65 (2dp), then baseline must
+    also be at 2dp precision, even if printed as "26.9".
+
+    Also checks arithmetic consistency: baseline - end ≈ change
+    (or baseline + change ≈ end, depending on sign convention).
+
+    Ref: Gideon Meyerowitz-Katz.
+
+    Returns:
+        dict with 'baseline_grim', 'end_grim', 'change_grim',
+        'row_dp', 'arithmetic_ok', and 'detail'.
+    """
+    strs = [baseline if isinstance(baseline, str) else f"{baseline}",
+            end if isinstance(end, str) else f"{end}",
+            change if isinstance(change, str) else f"{change}"]
+    row_dp = max(_dp_from_str(s) for s in strs)
+
+    b_val = float(baseline) if isinstance(baseline, str) else baseline
+    e_val = float(end) if isinstance(end, str) else end
+    c_val = float(change) if isinstance(change, str) else change
+
+    r_base = grim(b_val, n, scale=scale, dp=row_dp)
+    r_end = grim(e_val, n, scale=scale, dp=row_dp)
+    r_change = grim(c_val, n, scale=scale, dp=row_dp)
+
+    # Arithmetic: check if end - baseline ≈ change OR baseline - end ≈ change
+    # (sign conventions vary across papers)
+    diff = e_val - b_val
+    tolerance = 1.5 * (10 ** -row_dp)  # generous for rounding
+    arith_ok = (abs(diff - c_val) <= tolerance or
+                abs(-diff - c_val) <= tolerance)
+
+    flags = []
+    if not r_base['possible']:
+        flags.append(f"baseline {b_val} fails GRIM at {row_dp}dp")
+    if not r_end['possible']:
+        flags.append(f"end {e_val} fails GRIM at {row_dp}dp")
+    if not r_change['possible']:
+        flags.append(f"change {c_val} fails GRIM at {row_dp}dp")
+    if not arith_ok:
+        flags.append(
+            f"arithmetic: end-baseline={diff:.{row_dp}f}, "
+            f"reported change={c_val}"
+        )
+
+    prefix = f"{label}: " if label else ""
+    if flags:
+        detail = f"FLAG: {prefix}{'; '.join(flags)}"
+    else:
+        detail = f"PASS: {prefix}all row values consistent at {row_dp}dp"
+
+    return {
+        'baseline_grim': r_base,
+        'end_grim': r_end,
+        'change_grim': r_change,
+        'row_dp': row_dp,
+        'arithmetic_ok': arith_ok,
+        'flags': flags,
+        'detail': detail,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. GRIM FOR PERCENTAGES (formerly misnamed "DEBIT")
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def grim_percentage(percentage: float, n: int, dp: int = 1) -> dict:
+    """
+    GRIM applied to percentages/proportions derived from discrete counts.
+
+    If a paper says "40.0% of 26 participants responded", that implies
+    26 * 0.40 = 10.4 people — impossible (the nearest achievable are
+    10/26 = 38.5% and 11/26 = 42.3%). The count must be an integer.
+    (Note the boundary case: "88.5% of 26" is *not* impossible — 23/26 =
+    88.46% rounds to 88.5% — so it must PASS.)
+
+    Note: this is *not* the DEBIT test.  The real DEBIT (DEscriptive
+    BInary Test; Heathers & Brown 2019, osf.io/pm825) is a mean/SD/n
+    consistency check for binary data and is not implemented here.
+
+    Ref: Brown & Heathers (2017) "The GRIM Test" doi:10.1177/1948550616673876
+
+    Args:
+        percentage: reported percentage (e.g. 88.5 for 88.5%)
+        n:          sample size (denominator)
+        dp:         decimal places in the reported percentage
+
+    Returns:
+        dict with 'possible', 'implied_count', 'nearest_achievable', 'detail'.
+    """
+    if n <= 0:
+        return {
+            'possible': None,
+            'reported_percentage': percentage,
+            'n': n,
+            'detail': f"UNDETERMINED: invalid sample size n={n} — cannot test",
+        }
+    proportion = percentage / 100.0
+    implied_count = proportion * n
+
+    # The count must be an integer
+    tolerance = 0.5 * (10 ** -dp) / 100.0 * n
+    near_integer = abs(implied_count - round(implied_count)) <= tolerance
+
+    lower_count = math.floor(implied_count)
+    upper_count = math.ceil(implied_count)
+    lower_pct = round(lower_count / n * 100, dp + 2)
+    upper_pct = round(upper_count / n * 100, dp + 2)
+
+    result = {
+        'possible': near_integer,
+        'reported_percentage': percentage,
+        'n': n,
+        'implied_count': round(implied_count, 4),
+        'nearest_achievable_pcts': [lower_pct, upper_pct],
+        'nearest_achievable_counts': [lower_count, upper_count],
+    }
+    if near_integer:
+        result['detail'] = (
+            f"PASS: {percentage}% of {n} = {implied_count:.2f} "
+            f"(rounds to integer {round(implied_count)})"
+        )
+    else:
+        result['detail'] = (
+            f"FAIL: {percentage}% of {n} = {implied_count:.4f} people — "
+            f"not an integer. Nearest achievable: "
+            f"{lower_pct}% ({lower_count}/{n}) or "
+            f"{upper_pct}% ({upper_count}/{n})"
+        )
+    return result
+
+
+def debit(percentage: float, n: int, dp: int = 1) -> dict:
+    """
+    Deprecated alias for grim_percentage().
+
+    This function was misnamed: the real DEBIT (Heathers & Brown 2019,
+    osf.io/pm825) is a different test (mean/SD/n consistency for binary
+    data), while this check is GRIM applied to percentages.
+    """
+    warnings.warn(
+        "debit() is deprecated and was misnamed — it is GRIM for "
+        "percentages, not the DEBIT test. Use grim_percentage() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return grim_percentage(percentage, n, dp=dp)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. SPRITE (Sample Parameter Reconstruction via Iterative TEchniques)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sprite(
+    mean: float,
+    sd: float,
+    n: int,
+    lo: int = 0,
+    hi: int = 63,
+    max_iter: int = 2_000_000,
+    n_seeds: int = 5,
+    seed: int = 42,
+    dp: Optional[int] = None,
+    dp_sd: Optional[int] = None,
+    convention: str = "both",
+) -> dict:
+    """
+    SPRITE: attempt to reconstruct a valid dataset that produces the
+    reported mean and SD for bounded integer data.
+
+    If no valid dataset exists, the reported statistics are impossible.
+
+    Two-phase approach:
+      Phase 1 (analytical): enumerate all integer sums compatible with
+        the reported mean (within rounding), then check whether valid
+        integer sum-of-squares targets exist for the reported SD.
+      Phase 2 (search): for each feasible (sum, sum_sq) pair, run
+        randomized perturbation search with multiple seeds.
+
+    Verdicts: an analytic-precondition impossibility is a FAIL
+    ('possible': False); a search that exhausts its budget without
+    finding a dataset is only a FLAG ('possible': None) — the statistics
+    are not proven impossible.
+
+    Ref: Heathers, Anaya, van der Zee & Brown (2018)
+         doi:10.7287/peerj.preprints.26968v1
+
+    Args:
+        mean: reported mean
+        sd:   reported standard deviation
+        n:    sample size
+        lo:   minimum possible value (e.g. 0 for a 0-63 scale)
+        hi:   maximum possible value (e.g. 63 for a 0-63 scale)
+        max_iter: perturbation attempts per seed per target sum (default 2M)
+        n_seeds:  number of independent random seeds to try per sum
+        seed: base random seed for reproducibility
+        dp:   decimal places of the reported mean (auto-detected if None)
+        dp_sd: decimal places of the reported SD (auto-detected if None);
+               sets the SD rounding tolerance to ±0.5 ulp
+
+    Returns:
+        dict with 'possible', 'grim_possible', 'n_target_sums',
+        'n_sumsq_targets', 'example_dataset', 'closest', and 'detail'.
+    """
+    if n <= 0:
+        return {
+            'possible': None,
+            'n': n,
+            'detail': f"UNDETERMINED: invalid sample size n={n} — cannot test",
+        }
+    if n == 1:
+        return {
+            'possible': None,
+            'n': n,
+            'detail': "UNDETERMINED: SD is undefined for n=1 — cannot test",
+        }
+    if sd < 0:
+        return {
+            'possible': False,
+            'n': n,
+            'detail': f"FAIL: SD ({sd}) is negative — impossible",
+        }
+
+    # Auto-detect decimal places (mean and SD independently)
+    if dp is None:
+        s = str(mean)
+        dp = len(s.split('.')[-1]) if '.' in s else 0
+    if dp_sd is None:
+        s = str(sd)
+        dp_sd = len(s.split('.')[-1]) if '.' in s else 0
+
+    # ── Phase 1: analytical feasibility ──
+    # Inclusive rounding boundaries (see grim()): a value exactly 0.5 ulp
+    # away still rounds to the reported one, so pad with a small epsilon.
+    eps = 1e-9
+    half_unit = 0.5 * 10**(-dp)
+    ulp = 10**(-dp)
+    # Accepted true-mean interval: round-half's ±0.5 ulp, unioned (unless a
+    # strict round-half convention is requested) with the toward-zero
+    # truncation preimage — [mean, mean + ulp) for a non-negative mean,
+    # (mean − ulp, mean] for a negative one (see _truncation_interval).
+    # Both intervals contain the reported mean, so the union is contiguous.
+    trunc_allowed = convention in ("both", "truncate")
+    lo_round = math.ceil((mean - half_unit) * n - eps)
+    hi_round = math.floor((mean + half_unit) * n + eps)
+    mean_lo_bound = mean - half_unit
+    mean_hi_bound = mean + half_unit
+    if trunc_allowed:
+        t_lo, t_hi, t_lo_inc, t_hi_inc = _truncation_interval(mean, ulp)
+        # Strict (open) truncation bounds are tightened by eps; inclusive
+        # ones padded, matching grim()'s boundary semantics.
+        lo_trunc = math.ceil(t_lo * n - (eps if t_lo_inc else -eps))
+        hi_trunc = math.floor(t_hi * n + (eps if t_hi_inc else -eps))
+        lo_sum_raw = min(lo_round, lo_trunc)
+        hi_sum_raw = max(hi_round, hi_trunc)
+        mean_lo_bound = min(mean_lo_bound, t_lo)
+        mean_hi_bound = max(mean_hi_bound, t_hi)
+    else:
+        lo_sum_raw, hi_sum_raw = lo_round, hi_round
+    lo_sum = max(lo_sum_raw, lo * n)
+    hi_sum = min(hi_sum_raw, hi * n)
+    possible_sums = list(range(lo_sum, hi_sum + 1))
+
+    if not possible_sums:
+        return {
+            'possible': False,
+            'grim_possible': False,
+            'n_target_sums': 0,
+            'detail': (
+                f"FAIL: no integer sum compatible with mean={mean}, n={n} "
+                f"(GRIM failure). Sum range "
+                f"[{mean_lo_bound*n:.4f}, {mean_hi_bound*n:.4f}] "
+                f"(clamped to the scale bounds) contains no integer."
+            ),
+        }
+
+    # For each possible sum, find valid sum-of-squares range.
+    # SD rounding tolerance is ±0.5 ulp at the reported precision, with
+    # the lower bound clamped at 0 (an SD interval can never go negative;
+    # squaring a negative lower bound would fabricate a positive minimum).
+    half_sd = 0.5 * 10**(-dp_sd)
+    sd_lo = max(0.0, sd - half_sd)
+    sd_hi = sd + half_sd
+    target_var = sd ** 2
+
+    feasible_targets = []  # list of (target_sum, lo_sumsq, hi_sumsq)
+    total_sumsq_targets = 0
+    for ts in possible_sums:
+        lo_sumsq = sd_lo**2 * (n - 1) + ts**2 / n
+        hi_sumsq = sd_hi**2 * (n - 1) + ts**2 / n
+        lo_int = math.ceil(lo_sumsq - eps)
+        hi_int = math.floor(hi_sumsq + eps)
+        if lo_int <= hi_int:
+            feasible_targets.append((ts, lo_int, hi_int))
+            total_sumsq_targets += hi_int - lo_int + 1
+
+    # ── Phase 2: randomized search ──
+    best_var_diff = float('inf')
+    best_dataset = None
+    best_stats = None
+    found_dataset = None
+
+    for target_sum, _, _ in feasible_targets:
+        for seed_offset in range(n_seeds):
+            if found_dataset is not None:
+                break
+
+            rng = random.Random(seed + seed_offset + target_sum)
+
+            # Initialize dataset to hit target sum
+            data = [lo] * n
+            remaining = target_sum - lo * n
+            for i in range(n):
+                add = min(remaining, hi - lo)
+                data[i] = lo + add
+                remaining -= add
+                if remaining <= 0:
+                    break
+            rng.shuffle(data)
+
+            for _ in range(max_iter):
+                cur_mean = sum(data) / n
+                cur_var = sum((x - cur_mean) ** 2 for x in data) / (n - 1)
+                vd = abs(cur_var - target_var)
+
+                if vd < best_var_diff:
+                    best_var_diff = vd
+                    best_dataset = list(data)
+                    best_stats = (cur_mean, cur_var ** 0.5)
+
+                # Accept when the sum is on target AND the reconstructed SD
+                # rounds to the reported SD at its reported precision (the
+                # sum check guards the mean — an SD match alone can come
+                # from a dataset with the wrong mean)
+                if (sum(data) == target_sum
+                        and sd_lo - eps <= cur_var ** 0.5 <= sd_hi + eps):
+                    found_dataset = list(data)
+                    break
+
+                # Perturb: swap toward/away from target variance.  Every
+                # move must be a legal +1/-1 pair so the sum is invariant —
+                # a one-sided move would drift the mean off target.
+                i, j = rng.sample(range(n), 2)
+                if cur_var < target_var:
+                    if data[i] < hi and data[j] > lo:
+                        data[i] += 1
+                        data[j] -= 1
+                else:
+                    mid = int(round(cur_mean))
+                    if abs(data[i] - mid) > abs(data[j] - mid):
+                        far, near = i, j
+                    else:
+                        far, near = j, i
+                    if data[far] > mid and data[far] > lo and data[near] < hi:
+                        data[far] -= 1
+                        data[near] += 1
+                    elif data[far] < mid and data[far] < hi and data[near] > lo:
+                        data[far] += 1
+                        data[near] -= 1
+
+        if found_dataset is not None:
+            break
+
+    # ── Build result ──
+    # found → PASS; analytic impossibility → FAIL; budget exhausted with
+    # feasible targets remaining → FLAG (None), not FAIL
+    if found_dataset is not None:
+        verdict = True
+    elif not feasible_targets:
+        verdict = False
+    else:
+        verdict = None
+    result = {
+        'possible': verdict,
+        'grim_possible': True,
+        'n_target_sums': len(possible_sums),
+        'possible_sums': possible_sums,
+        'n_feasible_sum_targets': len(feasible_targets),
+        'n_sumsq_targets': total_sumsq_targets,
+        'target_mean': mean,
+        'target_sd': sd,
+        'n': n,
+        'range': [lo, hi],
+        'max_iter': max_iter,
+        'n_seeds': n_seeds,
+        'total_iterations': max_iter * n_seeds * len(feasible_targets),
+    }
+
+    if found_dataset is not None:
+        example = sorted(found_dataset)
+        actual_mean = sum(example) / n
+        actual_sd = (sum((x - actual_mean) ** 2 for x in example) / (n - 1)) ** 0.5
+        result['example_dataset'] = example
+        result['reconstructed_mean'] = round(actual_mean, 4)
+        result['reconstructed_sd'] = round(actual_sd, 4)
+        result['detail'] = (
+            f"PASS: valid dataset found. "
+            f"Reconstructs mean={actual_mean:.4f}, SD={actual_sd:.4f}"
+        )
+    else:
+        result['closest_var_diff'] = round(best_var_diff, 6)
+        if best_stats:
+            result['closest_mean'] = round(best_stats[0], 4)
+            result['closest_sd'] = round(best_stats[1], 4)
+        if not feasible_targets:
+            result['detail'] = (
+                f"FAIL: GRIM passes but no integer sum-of-squares is compatible "
+                f"with SD={sd} for any valid sum. "
+                f"The mean and SD are mutually impossible for n={n}, range=[{lo},{hi}]."
+            )
+        else:
+            result['detail'] = (
+                f"FLAG: {total_sumsq_targets} valid (sum, sum_sq) targets exist, "
+                f"but no dataset found within budget "
+                f"({result['total_iterations']:,} iterations: "
+                f"{n_seeds} seeds x {len(feasible_targets)} targets x {max_iter:,}). "
+                f"Closest SD: {best_stats[1]:.4f} (target {sd}, gap {best_var_diff:.6f}). "
+                f"Not proven impossible — statistics may be achievable but "
+                f"are highly constrained."
+            )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. Correlation bound from pre/post/change SDs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def correlation_bound(sd_pre: Union[str, float], sd_post: Union[str, float],
+                      sd_change: Union[str, float],
+                      dp: Optional[int] = None) -> dict:
+    """
+    Reverse-engineer the implied Pearson r between pre and post scores
+    from their SDs and the SD of the change score.
+
+    Var(change) = Var(pre) + Var(post) - 2*r*SD(pre)*SD(post)
+    => r = (SD_pre^2 + SD_post^2 - SD_change^2) / (2 * SD_pre * SD_post)
+
+    Reported SDs are rounded, so each is treated as a ±0.5-ulp interval
+    at its reported precision.  FAIL only if |r| > 1 across the *entire*
+    interval — i.e., no (pre, post, change) triple in the rounding box
+    satisfies |pre - post| <= change <= pre + post.
+
+    Args:
+        sd_pre, sd_post, sd_change: reported SDs (strings preserve
+            trailing zeros for dp inference)
+        dp: decimal places of all three SDs.  If None, inferred from
+            each value independently (see grim()).
+    """
+    def _half_ulp(v):
+        d = dp if dp is not None else _dp_from_str(v if isinstance(v, str) else f"{v}")
+        return 0.5 * (10 ** -d)
+
+    h_pre, h_post, h_chg = (_half_ulp(sd_pre), _half_ulp(sd_post),
+                            _half_ulp(sd_change))
+    sd_pre = float(sd_pre)
+    sd_post = float(sd_post)
+    sd_change = float(sd_change)
+
+    if sd_pre < 0 or sd_post < 0 or sd_change < 0:
+        return {
+            'possible': False,
+            'implied_r': None,
+            'detail': "FAIL: a negative SD is impossible",
+        }
+
+    numerator = sd_pre**2 + sd_post**2 - sd_change**2
+    denominator = 2 * sd_pre * sd_post
+
+    if denominator == 0:
+        # Constant pre or post data is valid; r is undefined, not impossible
+        return {
+            'possible': None,
+            'implied_r': None,
+            'detail': (
+                "UNDETERMINED: pre or post SD is 0 — the correlation is "
+                "undefined for constant data; cannot test (not evidence "
+                "of error)"
+            ),
+        }
+
+    implied_r = numerator / denominator
+    min_sd_change = abs(sd_pre - sd_post)
+    max_sd_change = sd_pre + sd_post
+
+    # Rounding intervals (SDs cannot go below 0)
+    eps = 1e-9
+    pre_lo, pre_hi = max(0.0, sd_pre - h_pre), sd_pre + h_pre
+    post_lo, post_hi = max(0.0, sd_post - h_post), sd_post + h_post
+    chg_lo, chg_hi = max(0.0, sd_change - h_chg), sd_change + h_chg
+
+    # |r| <= 1 somewhere in the box iff some change in [chg_lo, chg_hi]
+    # can reach [|pre - post|, pre + post] for some pre/post in range
+    min_gap = max(pre_lo - post_hi, post_lo - pre_hi, 0.0)
+    possible = (chg_hi >= min_gap - eps and
+                chg_lo <= pre_hi + post_hi + eps)
+
+    result = {
+        'possible': possible,
+        'implied_r': round(implied_r, 4),
+        'sd_pre': sd_pre,
+        'sd_post': sd_post,
+        'sd_change': sd_change,
+        'min_possible_sd_change': round(min_sd_change, 4),
+        'max_possible_sd_change': round(max_sd_change, 4),
+    }
+    if possible:
+        result['detail'] = (
+            f"PASS: implied r = {implied_r:.4f} is achievable within SD "
+            f"rounding. Plausible SD(change) range: "
+            f"[{min_sd_change:.4f}, {max_sd_change:.4f}]"
+        )
+    else:
+        result['detail'] = (
+            f"FAIL: implied r = {implied_r:.4f} — IMPOSSIBLE (|r| > 1 across "
+            f"the entire SD rounding interval). Reported SD(change) = "
+            f"{sd_change}, but valid range is "
+            f"[{min_sd_change:.4f}, {max_sd_change:.4f}]"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. P-value recalculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_ttest_paired(mean_change: float, sd_change: float, n: int,
+                       reported_p: Union[str, float]) -> dict:
+    """
+    Recalculate a paired t-test p-value from reported change statistics.
+
+    `reported_p` may be a string carrying an operator and precision
+    ("<0.001", "0.03") or a float (back-compat).  Consistency is judged by
+    the shared reported-p machinery (reported_stats.reported_p_verdict):
+    the operator is honoured and a significance-decision flip is caught,
+    instead of a crude ratio that mis-reads "p<0.001".
+    """
+    if sd_change < 0:
+        return {
+            'plausible': False,
+            'detail': f"FAIL: SD of change ({sd_change}) is negative, impossible"
+        }
+    if n <= 1:
+        return {
+            'plausible': None,
+            'detail': f"UNDETERMINED: invalid sample size n={n} — cannot test"
+        }
+    if sd_change == 0:
+        # Zero change-SD is possible data (all subjects changed identically)
+        return {
+            'plausible': None,
+            'detail': (
+                "UNDETERMINED: degenerate: cannot recompute the test "
+                "statistic (zero variance); not evidence of error"
+            )
+        }
+
+    se = sd_change / math.sqrt(n)
+    t_val = mean_change / se
+    df = n - 1
+    p_calc = float(sp.t.sf(abs(t_val), df) * 2)
+
+    from .reported_stats import parse_reported_p, reported_p_verdict
+    cmp = reported_p_verdict(p_calc, reported_p)
+    _, p_ref, p_ref_str = parse_reported_p(reported_p)
+    ratio = (round(max(p_calc, 1e-20) / max(p_ref, 1e-20), 2)
+             if p_ref is not None else None)
+    if cmp['verdict'] == 'UNDETERMINED':
+        # A garbled reported p cannot be judged — never an accusation
+        return {
+            'plausible': None,
+            't_calculated': round(t_val, 4),
+            'df': df,
+            'p_calculated': p_calc,
+            'p_reported': reported_p,
+            'ratio': ratio,
+            'detail': (
+                f"UNDETERMINED: t({df}) = {t_val:.4f}, calculated "
+                f"p = {p_calc:.2e}; {cmp['note']}"
+            ),
+        }
+    plausible = cmp['verdict'] == 'PASS'
+
+    return {
+        'plausible': plausible,
+        't_calculated': round(t_val, 4),
+        'df': df,
+        'p_calculated': p_calc,
+        'p_reported': reported_p,
+        'ratio': ratio,
+        'detail': (
+            f"{'PASS' if plausible else 'FLAG'}: "
+            f"t({df}) = {t_val:.4f}, calculated p = {p_calc:.2e}, "
+            f"reported p {cmp['reported_op']} {p_ref_str or reported_p} "
+            f"— {cmp['note']}."
+        )
+    }
+
+
+def check_ttest_independent(mean1: float, sd1: float, n1: int,
+                            mean2: float, sd2: float, n2: int,
+                            reported_p: Union[str, float]) -> dict:
+    """
+    Recalculate an independent-samples t-test (Welch's) from reported stats.
+
+    `reported_p` may be a string ("<0.001", "0.03") or a float (back-compat);
+    consistency and significance-decision flips are judged by the shared
+    reported_stats.reported_p_verdict machinery.
+    """
+    if sd1 < 0 or sd2 < 0:
+        return {'plausible': False,
+                'detail': "FAIL: a negative SD is impossible"}
+    if n1 <= 1 or n2 <= 1:
+        return {'plausible': None,
+                'detail': (f"UNDETERMINED: invalid sample sizes "
+                           f"(n1={n1}, n2={n2}) — cannot test")}
+    se = math.sqrt(sd1**2 / n1 + sd2**2 / n2)
+    if se == 0:
+        # Both SDs zero is possible data (constant groups)
+        return {
+            'plausible': None,
+            'detail': (
+                "UNDETERMINED: degenerate: cannot recompute the test "
+                "statistic (zero variance); not evidence of error"
+            )
+        }
+
+    t_val = (mean1 - mean2) / se
+    num = (sd1**2 / n1 + sd2**2 / n2)**2
+    den = (sd1**2 / n1)**2 / (n1 - 1) + (sd2**2 / n2)**2 / (n2 - 1)
+    df = num / den
+    p_calc = float(sp.t.sf(abs(t_val), df) * 2)
+
+    from .reported_stats import parse_reported_p, reported_p_verdict
+    cmp = reported_p_verdict(p_calc, reported_p)
+    _, p_ref, p_ref_str = parse_reported_p(reported_p)
+    ratio = (round(max(p_calc, 1e-20) / max(p_ref, 1e-20), 2)
+             if p_ref is not None else None)
+    if cmp['verdict'] == 'UNDETERMINED':
+        # A garbled reported p cannot be judged — never an accusation
+        return {
+            'plausible': None,
+            't_calculated': round(t_val, 4),
+            'df': round(df, 2),
+            'p_calculated': p_calc,
+            'p_reported': reported_p,
+            'ratio': ratio,
+            'detail': (
+                f"UNDETERMINED: t({df:.1f}) = {t_val:.4f}, calculated "
+                f"p = {p_calc:.2e}; {cmp['note']}"
+            ),
+        }
+    plausible = cmp['verdict'] == 'PASS'
+
+    return {
+        'plausible': plausible,
+        't_calculated': round(t_val, 4),
+        'df': round(df, 2),
+        'p_calculated': p_calc,
+        'p_reported': reported_p,
+        'ratio': ratio,
+        'detail': (
+            f"{'PASS' if plausible else 'FLAG'}: "
+            f"t({df:.1f}) = {t_val:.4f}, calculated p = {p_calc:.2e}, "
+            f"reported p {cmp['reported_op']} {p_ref_str or reported_p} "
+            f"— {cmp['note']}."
+        )
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. Sample size back-calculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sample_size_from_t(t_val: float, p_reported: Union[str, float],
+                       reported_n: int, two_tailed: bool = True,
+                       dp: Optional[int] = None) -> dict:
+    """
+    From a reported t-statistic and p-value, check whether they are
+    consistent with the stated n.
+
+    A reported p-value is rounded, so it cannot be inverted as exact:
+    PASS if the exact p at the stated n's df rounds to the reported p
+    at its reported precision; FLAG only if the exact p falls outside
+    the reported p's entire rounding interval.  The range of n values
+    consistent with the reported p is returned as information.
+
+    Args:
+        t_val:       reported t-statistic
+        p_reported:  reported p-value (string preserves trailing zeros)
+        reported_n:  stated sample size (for comparison)
+        two_tailed:  whether the test is two-tailed
+        dp:          decimal places of the reported p (inferred if None)
+    """
+    if dp is None:
+        dp = _dp_from_str(p_reported if isinstance(p_reported, str)
+                          else f"{p_reported}")
+    p_reported = float(p_reported)
+
+    if reported_n <= 1:
+        return {
+            'plausible': None,
+            'reported_n': reported_n,
+            'detail': (f"UNDETERMINED: invalid sample size n={reported_n} "
+                       f"— cannot test"),
+        }
+
+    # Rounding interval of the reported p (inclusive boundary, see grim())
+    half_ulp = 0.5 * (10 ** -dp)
+    eps = 1e-12
+    p_lo = p_reported - half_ulp - eps
+    p_hi = p_reported + half_ulp + eps
+    tails = 2 if two_tailed else 1
+
+    # Exact p at the stated n's df (one-sample/paired: df = n - 1)
+    stated_df = reported_n - 1
+    p_at_stated = float(sp.t.sf(abs(t_val), stated_df)) * tails
+    match = p_lo <= p_at_stated <= p_hi
+
+    # Which df values (1..10000) are consistent with the reported p?
+    import numpy as np
+    dfs = np.arange(1, 10001)
+    p_all = sp.t.sf(abs(t_val), dfs) * tails
+    idx = np.nonzero((p_all >= p_lo) & (p_all <= p_hi))[0]
+    if idx.size:
+        implied_n_range = [int(dfs[idx[0]]) + 1, int(dfs[idx[-1]]) + 1]
+    else:
+        implied_n_range = None
+
+    return {
+        'plausible': match,
+        'p_at_stated_n': p_at_stated,
+        'implied_n_range': implied_n_range,
+        'reported_n': reported_n,
+        'detail': (
+            f"{'PASS' if match else 'FLAG'}: "
+            f"t={t_val} at stated n={reported_n} (df={stated_df}) gives "
+            f"p={p_at_stated:.4g}, which "
+            f"{'rounds to' if match else 'does not round to'} reported "
+            f"p={p_reported}. "
+            + (f"n consistent with reported p: "
+               f"{implied_n_range[0]}-{implied_n_range[1]}"
+               if implied_n_range else
+               "no n in 2-10001 reproduces the reported p")
+        )
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Effect size consistency (RIVETS-style)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def effect_size_consistency(
+    mean1: float, sd1: float, n1: int,
+    mean2: float, sd2: float, n2: int,
+    reported_d: Optional[float] = None,
+    reported_p: Union[str, float, None] = None,
+    reported_ci_lower: Optional[float] = None,
+    reported_ci_upper: Optional[float] = None,
+) -> dict:
+    """
+    Check mutual consistency of reported effect sizes, p-values, and CIs.
+
+    Computes Cohen's d, t-statistic, p-value, and 95% CI from the raw
+    statistics and flags discrepancies with any reported values.
+    `reported_p` may be a string carrying an operator ("<0.001", "0.03");
+    it is judged by the shared reported_stats.reported_p_verdict machinery.
+    """
+    # Pooled SD (Cohen's d denominator)
+    pooled_sd = math.sqrt(((n1 - 1) * sd1**2 + (n2 - 1) * sd2**2) / (n1 + n2 - 2))
+    if pooled_sd == 0:
+        # Both groups constant is possible data — the effect size is just
+        # undefined (0/0), not evidence of error.  Degenerate, never FAIL.
+        return {
+            'possible': None,
+            'detail': (
+                "UNDETERMINED: degenerate: cannot compute the effect size "
+                "(pooled SD is 0 / zero variance); not evidence of error"
+            ),
+        }
+
+    calc_d = (mean1 - mean2) / pooled_sd
+
+    # t and p via Welch's
+    se = math.sqrt(sd1**2 / n1 + sd2**2 / n2)
+    t_val = (mean1 - mean2) / se if se > 0 else float('inf')
+    num = (sd1**2 / n1 + sd2**2 / n2)**2
+    den = (sd1**2 / n1)**2 / (n1 - 1) + (sd2**2 / n2)**2 / (n2 - 1)
+    df = num / den if den > 0 else 1
+    calc_p = sp.t.sf(abs(t_val), df) * 2
+
+    # 95% CI for the mean difference
+    diff = mean1 - mean2
+    t_crit = sp.t.ppf(0.975, df)
+    ci_lower = float(diff - t_crit * se)
+    ci_upper = float(diff + t_crit * se)
+
+    flags = []
+
+    if reported_d is not None:
+        d_diff = abs(calc_d - reported_d)
+        if d_diff > 0.1:
+            flags.append(
+                f"Cohen's d: calculated {calc_d:.3f}, reported {reported_d:.3f} "
+                f"(diff {d_diff:.3f})"
+            )
+
+    if reported_p is not None:
+        # Route through the shared reported-p machinery: string operators
+        # ("<0.001", "0.03") are honoured and malformed input yields
+        # UNDETERMINED (cannot check — never a crash, never an accusation).
+        from .reported_stats import reported_p_verdict
+        cmp = reported_p_verdict(calc_p, reported_p)
+        if cmp['verdict'] == 'FLAG':
+            flags.append(
+                f"p-value: calculated {calc_p:.2e}, reported {reported_p} "
+                f"({cmp['note']})"
+            )
+
+    if reported_ci_lower is not None and reported_ci_upper is not None:
+        ci_lower_diff = abs(ci_lower - reported_ci_lower)
+        ci_upper_diff = abs(ci_upper - reported_ci_upper)
+        if ci_lower_diff > 0.5 or ci_upper_diff > 0.5:
+            flags.append(
+                f"95% CI: calculated [{ci_lower:.2f}, {ci_upper:.2f}], "
+                f"reported [{reported_ci_lower}, {reported_ci_upper}]"
+            )
+
+    consistent = len(flags) == 0
+    result = {
+        'consistent': consistent,
+        'calculated_d': round(calc_d, 4),
+        'calculated_p': calc_p,
+        'calculated_ci': [round(ci_lower, 4), round(ci_upper, 4)],
+        'calculated_t': round(t_val, 4),
+        'df': round(df, 2),
+        'flags': flags,
+    }
+    if consistent:
+        result['detail'] = (
+            f"PASS: effect sizes internally consistent. "
+            f"d={calc_d:.3f}, p={calc_p:.2e}, 95% CI [{ci_lower:.2f}, {ci_upper:.2f}]"
+        )
+    else:
+        result['detail'] = (
+            f"FLAG: {len(flags)} inconsistenc{'y' if len(flags) == 1 else 'ies'} "
+            f"detected: {'; '.join(flags)}"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Benford's law
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def benfords_law(values: List[float], label: str = "") -> dict:
+    """
+    Test whether the first digits of a set of values follow Benford's
+    distribution. Fabricated data tends to have too-uniform first digits.
+
+    Uses a chi-squared goodness-of-fit test. Requires >= 50 values
+    for meaningful results.
+
+    Applicability guard: Benford's law only applies to data that spans
+    several orders of magnitude.  If every value shares roughly the same
+    magnitude (max/min < 10 — e.g. adult ages, Likert means), the first
+    digits are NOT expected to be Benford-distributed, so a deviation is
+    meaningless and the result is UNDETERMINED rather than a FLAG.
+
+    Args:
+        values: list of numeric values (zeros and negatives are handled)
+        label:  optional label for the dataset
+    """
+    # Extract first significant digits
+    digits = []
+    magnitudes = []
+    for v in values:
+        v = abs(v)
+        if v == 0:
+            continue
+        magnitudes.append(v)
+        # Normalize to [1, 10)
+        while v < 1:
+            v *= 10
+        while v >= 10:
+            v /= 10
+        digits.append(int(v))
+
+    n = len(digits)
+    if n < 50:
+        return {
+            'sufficient_data': False,
+            'n': n,
+            'detail': f"SKIP: only {n} values; need >= 50 for Benford's test"
+        }
+
+    # Applicability: data must span > 1 order of magnitude for Benford
+    span = max(magnitudes) / min(magnitudes) if magnitudes else 0
+    if span < 10:
+        return {
+            'applicable': False,
+            'n': n,
+            'span': round(span, 3),
+            'detail': (
+                f"UNDETERMINED: {label + ': ' if label else ''}"
+                f"narrow-range data (max/min = {span:.2f} < 10, spans <1 "
+                f"order of magnitude) — Benford's law not applicable, "
+                f"cannot test"
+            ),
+        }
+
+    # Expected Benford frequencies
+    benford_expected = {d: math.log10(1 + 1/d) for d in range(1, 10)}
+
+    observed = Counter(digits)
+    chi2 = 0
+    digit_details = {}
+    for d in range(1, 10):
+        obs = observed.get(d, 0)
+        exp = benford_expected[d] * n
+        chi2 += (obs - exp) ** 2 / exp
+        digit_details[d] = {
+            'observed': obs,
+            'expected': round(exp, 1),
+            'obs_pct': round(obs / n * 100, 1),
+            'exp_pct': round(benford_expected[d] * 100, 1),
+        }
+
+    # Chi-squared with 8 df (9 digits - 1)
+    p_value = sp.chi2.sf(chi2, df=8)
+    conforms = p_value > 0.05
+
+    result = {
+        'conforms': conforms,
+        'chi2': round(chi2, 4),
+        'p_value': round(p_value, 6),
+        'n': n,
+        'digit_details': digit_details,
+    }
+    if conforms:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"first digits conform to Benford's law "
+            f"(chi2={chi2:.2f}, p={p_value:.4f}, n={n})"
+        )
+    else:
+        result['detail'] = (
+            f"FLAG: {label + ': ' if label else ''}"
+            f"first digits deviate from Benford's law "
+            f"(chi2={chi2:.2f}, p={p_value:.4f}, n={n}). "
+            f"May indicate fabrication or non-natural data generation."
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. Variance ratio test
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def variance_ratio_test(
+    sds: List[float],
+    ns: List[int],
+    labels: Optional[List[str]] = None,
+) -> dict:
+    """
+    Check whether the reported SDs across groups are implausibly similar.
+
+    Fabricated data often shows nearly identical SDs across treatment
+    groups because fabricators assume "random" means "equal variance."
+
+    Uses an F-test on the ratio of largest to smallest variance and
+    flags suspiciously uniform SDs.
+
+    Args:
+        sds:    list of reported SDs (one per group)
+        ns:     list of sample sizes (one per group)
+        labels: optional group labels
+    """
+    if len(sds) < 2:
+        return {'detail': "SKIP: need at least 2 groups for variance ratio test"}
+
+    if labels is None:
+        labels = [f"Group {i+1}" for i in range(len(sds))]
+
+    variances = [sd**2 for sd in sds]
+    max_var = max(variances)
+    min_var = min(variances)
+
+    if min_var == 0:
+        # A constant group (SD = 0) is possible data — the variance ratio
+        # is merely undefined (division by zero), not impossible.  Surface
+        # it as a suspicious flag, never as 'possible: False'.
+        return {
+            'f_ratio': None,
+            'suspiciously_similar': False,
+            'sds': dict(zip(labels, [round(s, 4) for s in sds])),
+            'flags': ["at least one group has SD = 0 (constant group) — "
+                      "variance ratio undefined"],
+            'detail': (
+                "FLAG: at least one group has SD = 0 (constant group); "
+                "variance ratio is undefined — not evidence of error"
+            ),
+        }
+
+    f_ratio = max_var / min_var
+    max_idx = variances.index(max_var)
+    min_idx = variances.index(min_var)
+
+    # F-test
+    df1 = ns[max_idx] - 1
+    df2 = ns[min_idx] - 1
+    p_value = sp.f.sf(f_ratio, df1, df2) * 2  # two-tailed
+
+    # Suspiciously similar: F-ratio very close to 1 for small samples
+    # (in real data, small samples produce noisy variance estimates)
+    total_n = sum(ns)
+    suspiciously_similar = (f_ratio < 1.05 and total_n < 100 and len(sds) >= 3)
+
+    result = {
+        'f_ratio': round(f_ratio, 4),
+        'p_value': round(p_value, 6),
+        'suspiciously_similar': suspiciously_similar,
+        'sds': dict(zip(labels, [round(s, 4) for s in sds])),
+        'max_group': labels[max_idx],
+        'min_group': labels[min_idx],
+    }
+
+    flags = []
+    if suspiciously_similar:
+        flags.append(
+            f"SDs are suspiciously similar (F={f_ratio:.4f}) for "
+            f"small samples (total n={total_n})"
+        )
+    if p_value < 0.01:
+        flags.append(
+            f"Significant variance heterogeneity (F={f_ratio:.2f}, p={p_value:.4f})"
+        )
+
+    result['flags'] = flags
+    if flags:
+        result['detail'] = f"FLAG: {'; '.join(flags)}"
+    else:
+        result['detail'] = (
+            f"PASS: variance ratio F={f_ratio:.2f} between "
+            f"{labels[max_idx]} and {labels[min_idx]} (p={p_value:.4f})"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. Arithmetic consistency + SD sign check
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_change_arithmetic(baseline: Union[str, float], end: Union[str, float],
+                            reported_change: Union[str, float], label: str = "",
+                            tolerance: Optional[float] = None) -> dict:
+    """
+    Check whether End - Baseline = reported Change (within rounding).
+
+    Each of the three values is rounded at its OWN printed precision, so
+    the tolerance is the sum of the three per-cell rounding half-widths
+    (interval-overlap arithmetic):
+
+        0.5·10^−dp_baseline + 0.5·10^−dp_end + 0.5·10^−dp_change
+
+    A uniform-precision row reduces to the familiar 1.5·10^−dp, and a
+    mixed-precision row like '26' / '11.6' / '-15' (true 26.4 / 11.6 /
+    −14.8) gets 0.5 + 0.05 + 0.5 = 1.05 — PASSED, where a single-dp rule
+    at the finest precision (0.15) falsely FAILed it.  Pass values as
+    *strings* to preserve their printed precision; a float falls back to
+    its repr's dp.  An explicit `tolerance` overrides the dp rule.
+
+    Ref: Brown & Heathers (2017); Gideon Meyerowitz-Katz (2026).
+    """
+    if tolerance is None:
+        tolerance = sum(
+            0.5 * 10 ** -_dp_from_str(v if isinstance(v, str) else f"{v}")
+            for v in (baseline, end, reported_change)
+        )
+
+    b_val = float(baseline)
+    e_val = float(end)
+    c_val = float(reported_change)
+    expected = round(e_val - b_val, 4)
+    diff = abs(expected - c_val)
+    ok = diff <= tolerance + 1e-9
+
+    return {
+        'consistent': ok,
+        'expected_change': expected,
+        'reported_change': c_val,
+        'discrepancy': round(diff, 4),
+        'tolerance': round(tolerance, 6),
+        'detail': (
+            f"{'PASS' if ok else 'FAIL'}: {label + ': ' if label else ''}"
+            f"End ({e_val}) - Baseline ({b_val}) = {expected}, "
+            f"reported as {c_val}"
+            f"{'' if ok else f' [discrepancy: {diff:.4f} > tol {tolerance:.4f}]'}"
+        )
+    }
+
+
+def check_sd_positive(sd: float, label: str = "") -> dict:
+    """SDs cannot be negative."""
+    ok = sd >= 0
+    return {
+        'possible': ok,
+        'sd': sd,
+        'detail': (
+            f"{'PASS' if ok else 'FAIL'}: {label + ': ' if label else ''}"
+            f"SD = {sd}"
+            f"{'' if ok else ' — IMPOSSIBLE: standard deviation cannot be negative'}"
+        )
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. GRIMMER (SD consistency for integer data)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DATASET_EXISTS_BUDGET = 200_000  # memo-entry cap for the exact DP
+
+
+def _integer_dataset_exists(k: int, s: int, q: int, lo: int, hi: int,
+                            memo: dict) -> Optional[bool]:
+    """
+    Exact test: do k integers in [lo, hi] exist with sum s and sum of
+    squares q?  Memoized DFS over (slots, sum, sumsq) with analytic
+    pruning; order is irrelevant for existence, so states stay small.
+    Returns True/False, or None if the memo budget is exhausted (an
+    honest "don't know", never a verdict).
+    """
+    if k > 500:
+        return None  # recursion guard; fall back to undetermined
+    if k == 0:
+        return s == 0 and q == 0
+    if s < k * lo or s > k * hi:
+        return False
+    if q * k < s * s:
+        return False  # Cauchy-Schwarz: sumsq >= s^2 / k
+    if q > (lo + hi) * s - k * lo * hi:
+        return False  # for x in [lo, hi]: x^2 <= (lo+hi)x - lo*hi
+    key = (k, s, q)
+    if key in memo:
+        return memo[key]
+    if len(memo) >= _DATASET_EXISTS_BUDGET:
+        return None
+    found = False
+    for v in range(hi, lo - 1, -1):
+        sub = _integer_dataset_exists(k - 1, s - v, q - v * v, lo, hi, memo)
+        if sub is None:
+            return None  # budget hit below — don't cache, don't conclude
+        if sub:
+            found = True
+            break
+    memo[key] = found
+    return found
+
+
+def grimmer(mean: Union[str, float], sd: Union[str, float], n: int,
+            scale: int = 1,
+            dp_mean: Optional[int] = None,
+            dp_sd: Optional[int] = None,
+            convention: str = "both") -> dict:
+    """
+    GRIMMER test: is this SD possible for n integer-valued observations
+    with the given mean?
+
+    Extends GRIM to standard deviations. For integer data with known n
+    and mean, the sum of squares must be an integer, which constrains
+    the achievable SDs.  Every integer sum admitted by the GRIM gate is
+    tested, and (for integer data) candidate sums of squares must match
+    the parity of the sum, since sum(x^2) ≡ sum(x) (mod 2).  Those
+    conditions are necessary but not sufficient, so for scale=1 each
+    surviving (sum, sum-of-squares) target is verified exactly against
+    an integer dataset (bounded DP); a PASS means a dataset exists, a
+    FAIL means none does, and an exhausted search budget reports
+    UNDETERMINED rather than a verdict.
+
+    Ref: Anaya (2016) doi:10.7287/peerj.preprints.2400v1
+
+    Args:
+        mean:    reported mean (string preserves trailing zeros)
+        sd:      reported SD (string preserves trailing zeros)
+        n:       sample size
+        scale:   granularity (1 for integers)
+        dp_mean: decimal places of the mean (inferred from string if None)
+        dp_sd:   decimal places of the SD (inferred from string if None)
+    """
+    if isinstance(mean, str):
+        if dp_mean is None:
+            dp_mean = _dp_from_str(mean)
+        mean = float(mean)
+    elif dp_mean is None:
+        dp_mean = _dp_from_str(f"{mean}")
+
+    if isinstance(sd, str):
+        if dp_sd is None:
+            dp_sd = _dp_from_str(sd)
+        sd = float(sd)
+    elif dp_sd is None:
+        dp_sd = _dp_from_str(f"{sd}")
+    if n <= 0:
+        return {
+            'possible': None,
+            'n': n,
+            'detail': f"UNDETERMINED: invalid sample size n={n} — cannot test",
+        }
+    if sd < 0:
+        return {
+            'possible': False,
+            'grim_pass': None,
+            'detail': f"FAIL: SD ({sd}) is negative — impossible",
+        }
+    # GRIM gate (Brown & Heathers 2017 rounding conventions): the mean's
+    # true sum may satisfy round-half OR toward-zero truncation.  Enumerate
+    # every integer sum in the union of the round-half interval
+    # [mean − 0.5 ulp, mean + 0.5 ulp] and the truncation preimage —
+    # [mean, mean + ulp) for a non-negative mean, (mean − ulp, mean] for a
+    # negative one (see _truncation_interval).  If NONE exists the mean is
+    # robustly impossible (GRIM fails).
+    eps = 1e-9
+    half_mean = 0.5 * 10**(-dp_mean)
+    ulp_mean = 10**(-dp_mean)
+    trunc_allowed = convention in ("both", "truncate")
+    lo_round = math.ceil((mean - half_mean) * n / scale - eps)
+    hi_round = math.floor((mean + half_mean) * n / scale + eps)
+    if trunc_allowed:
+        t_lo, t_hi, t_lo_inc, t_hi_inc = _truncation_interval(mean, ulp_mean)
+        # Strict (open) truncation bounds are tightened by eps before the
+        # ceil/floor (a value exactly at an open bound would display as the
+        # neighbouring printed value); inclusive bounds are padded.
+        lo_trunc = math.ceil(t_lo * n / scale - (eps if t_lo_inc else -eps))
+        hi_trunc = math.floor(t_hi * n / scale + (eps if t_hi_inc else -eps))
+        lo_sum = min(lo_round, lo_trunc)
+        hi_sum = max(hi_round, hi_trunc)
+    else:
+        lo_sum, hi_sum = lo_round, hi_round
+    candidate_sums = [k * scale for k in range(lo_sum, hi_sum + 1)]
+    implied_sum = round(mean * n)
+
+    if not candidate_sums:
+        return {
+            'possible': False,
+            'grim_pass': False,
+            'detail': (
+                f"FAIL: GRIM fails first — mean {mean} is impossible for "
+                f"integer-granular data at n={n} under round-half and "
+                f"truncation rounding"
+            ),
+        }
+
+    # SD^2 * (n-1) = sum_of_squares - sum^2 / n
+    # Sum of squares must be an integer (sum of integer squares).
+    # Allow rounding tolerance on the SD, clamping the lower bound at 0
+    # (a negative bound would be squared into a spurious positive minimum)
+    sd_lo = max(0.0, sd - 0.5 * 10**(-dp_sd))
+    sd_hi = sd + 0.5 * 10**(-dp_sd)
+
+    valid_sums = []
+    per_sum = []
+    sumsq_targets = {}  # ts -> parity-consistent integer sum-of-squares list
+    n_valid_sumsq = 0
+    for ts in candidate_sums:
+        lo_sumsq = sd_lo**2 * (n - 1) + ts**2 / n
+        hi_sumsq = sd_hi**2 * (n - 1) + ts**2 / n
+        lo_int = math.ceil(lo_sumsq - eps)
+        hi_int = math.floor(hi_sumsq + eps)
+        n_ints = max(0, hi_int - lo_int + 1)
+        if n_ints and scale == 1:
+            # Parity: x^2 ≡ x (mod 2) for integers, so sum(x^2) must
+            # match the parity of the sum — exact, never a false FAIL
+            parity = ts % 2
+            first = lo_int if lo_int % 2 == parity else lo_int + 1
+            if first > hi_int:
+                n_ints = 0
+            else:
+                n_ints = (hi_int - first) // 2 + 1
+                sumsq_targets[ts] = list(range(first, hi_int + 1, 2))
+        per_sum.append({
+            'sum': ts,
+            'sumsq_range': [round(lo_sumsq, 4), round(hi_sumsq, 4)],
+            'n_valid_sumsq': n_ints,
+        })
+        if n_ints:
+            valid_sums.append(ts)
+            n_valid_sumsq += n_ints
+
+    # Integer sum-of-squares + parity are necessary, NOT sufficient — e.g.
+    # sum=15, sumsq=79, n=3 passes both, but no integer triple achieves it.
+    # For scale=1, constructively verify each (sum, sumsq) target with an
+    # exact bounded DP; the value bound mean ± sd_hi*(n-1)/sqrt(n) is
+    # exhaustive (no dataset within SD tolerance can exceed it), so False
+    # here is a proof.  Budget-exhausted → None (undetermined), never FAIL.
+    representable = None
+    if valid_sums and scale == 1:
+        representable = False
+        checked = 0
+        for ts in valid_sums:
+            dev = sd_hi * (n - 1) / math.sqrt(n)
+            lo_b = math.floor(ts / n - dev)
+            hi_b = math.ceil(ts / n + dev)
+            memo = {}
+            for q in sumsq_targets.get(ts, []):
+                checked += 1
+                if checked > 200:
+                    representable = None
+                    break
+                exists = _integer_dataset_exists(n, ts, q, lo_b, hi_b, memo)
+                if exists is None:
+                    representable = None
+                elif exists:
+                    representable = True
+                    break
+            if representable is True or checked > 200:
+                break
+        if checked > 200 and representable is not True:
+            representable = None
+
+    if not valid_sums:
+        possible = False
+    elif scale != 1:
+        possible = True  # necessary conditions only (multi-item averages)
+    else:
+        possible = representable
+
+    result = {
+        'possible': possible,
+        'grim_pass': True,
+        'reported_mean': mean,
+        'reported_sd': sd,
+        'n': n,
+        'implied_sum': implied_sum,
+        'candidate_sums': candidate_sums,
+        'valid_sums': valid_sums,
+        'per_sum': per_sum,
+        'n_valid_sumsq': n_valid_sumsq,
+    }
+    if possible:
+        result['detail'] = (
+            f"PASS: SD={sd} is achievable with mean={mean}, n={n} "
+            f"(valid sum(s): {valid_sums}; "
+            f"{n_valid_sumsq} sum-of-squares target(s))."
+        )
+    elif possible is None:
+        # The exact dataset-existence DP truncated (memo/recursion budget)
+        # before it could prove or refute representability — an honest
+        # "don't know", never an accusation.  Verdict and detail must agree:
+        # UNDETERMINED, NOT 'FAIL:'.
+        result['detail'] = (
+            f"UNDETERMINED: SD={sd} with mean={mean}, n={n} could not be "
+            f"resolved — the integer-dataset search exceeded its budget "
+            f"before proving or refuting existence; cannot test."
+        )
+    else:
+        result['detail'] = (
+            f"FAIL: SD={sd} is impossible with mean={mean}, n={n} — no "
+            f"integer sum of squares (with matching parity) exists for any "
+            f"GRIM-consistent sum {candidate_sums}. Impossible for "
+            f"integer-granular data at n={n} under half-up rounding."
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. One-way ANOVA recalculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_anova_oneway(
+    means: List[float],
+    sds: List[float],
+    ns: List[int],
+    reported_f: Optional[float] = None,
+    reported_p: Optional[float] = None,
+    labels: Optional[List[str]] = None,
+) -> dict:
+    """
+    Recalculate a one-way ANOVA F-statistic from reported group statistics.
+
+    F = MS_between / MS_within
+
+    Ref: Heathers (2025) ch. "One-way ANOVA"
+    """
+    k = len(means)
+    if k < 2:
+        return {'detail': "SKIP: need at least 2 groups"}
+    if any(sd < 0 for sd in sds):
+        return {'consistent': False,
+                'detail': "FAIL: a negative SD is impossible"}
+    if labels is None:
+        labels = [f"Group {i+1}" for i in range(k)]
+
+    N = sum(ns)
+    grand_mean = sum(m * n for m, n in zip(means, ns)) / N
+
+    # Between-groups SS
+    ss_between = sum(n * (m - grand_mean)**2 for m, n in zip(means, ns))
+    df_between = k - 1
+    ms_between = ss_between / df_between
+
+    # Within-groups SS (from reported SDs)
+    ss_within = sum((n - 1) * sd**2 for n, sd in zip(ns, sds))
+    df_within = N - k
+    ms_within = ss_within / df_within if df_within > 0 else float('inf')
+
+    if ms_within == 0:
+        # Zero within-group variance is possible data (constant groups)
+        return {
+            'consistent': None,
+            'detail': (
+                "UNDETERMINED: degenerate: cannot recompute the test "
+                "statistic (zero within-group variance); not evidence "
+                "of error"
+            )
+        }
+
+    f_calc = ms_between / ms_within
+    p_calc = float(sp.f.sf(f_calc, df_between, df_within))
+
+    flags = []
+    if reported_f is not None:
+        f_diff = abs(f_calc - reported_f)
+        if f_diff > max(0.1, 0.1 * reported_f):
+            flags.append(
+                f"F: calculated {f_calc:.3f}, reported {reported_f}"
+            )
+
+    if reported_p is not None:
+        from .reported_stats import parse_reported_p, reported_p_verdict
+        cmp = reported_p_verdict(p_calc, reported_p)
+        # UNDETERMINED = the reported p was garbled and cannot be judged —
+        # skip the comparison rather than flagging a parsing problem.
+        if cmp['verdict'] == 'FLAG':
+            _, _, p_ref_str = parse_reported_p(reported_p)
+            flags.append(
+                f"p: calculated {p_calc:.2e}, reported "
+                f"{cmp['reported_op']} {p_ref_str} — {cmp['note']}"
+            )
+
+    result = {
+        'consistent': len(flags) == 0,
+        'f_calculated': round(f_calc, 4),
+        'p_calculated': p_calc,
+        'df_between': df_between,
+        'df_within': df_within,
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = f"FLAG: {'; '.join(flags)}"
+    else:
+        result['detail'] = (
+            f"PASS: F({df_between},{df_within}) = {f_calc:.3f}, "
+            f"p = {p_calc:.2e}"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. Chi-squared recalculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_chi_squared(
+    observed: List[List[int]],
+    reported_chi2: Optional[float] = None,
+    reported_p: Optional[float] = None,
+    label: str = "",
+) -> dict:
+    """
+    Recalculate chi-squared from a contingency table.
+
+    Args:
+        observed: 2D list of observed counts (rows x cols)
+        reported_chi2: reported chi-squared statistic
+        reported_p: reported p-value
+
+    Ref: Heathers (2025) ch. "Chi-squared"
+    """
+    import numpy as np
+    obs = np.array(observed)
+    row_totals = obs.sum(axis=1)
+    col_totals = obs.sum(axis=0)
+    n_total = obs.sum()
+
+    if n_total == 0:
+        return {'detail': "FAIL: table sums to 0"}
+
+    # Expected frequencies
+    expected = np.outer(row_totals, col_totals) / n_total
+
+    # Chi-squared (uncorrected Pearson)
+    chi2_calc = float(np.sum((obs - expected)**2 / expected))
+    df = (obs.shape[0] - 1) * (obs.shape[1] - 1)
+    p_calc = float(sp.chi2.sf(chi2_calc, df))
+
+    # For 2x2 tables also compute the Yates continuity-corrected value —
+    # the SPSS default — and accept a reported match against either
+    chi2_yates = None
+    p_yates = None
+    if obs.shape == (2, 2):
+        chi2_yates = float(np.sum(
+            np.maximum(np.abs(obs - expected) - 0.5, 0)**2 / expected))
+        p_yates = float(sp.chi2.sf(chi2_yates, df))
+
+    flags = []
+    chi2_matched = None
+    if reported_chi2 is not None:
+        def _chi2_close(calc):
+            return abs(calc - reported_chi2) <= max(0.1, 0.05 * reported_chi2)
+        if _chi2_close(chi2_calc):
+            chi2_matched = 'pearson'
+        elif chi2_yates is not None and _chi2_close(chi2_yates):
+            chi2_matched = 'yates'
+        else:
+            flags.append(
+                f"chi2: calculated {chi2_calc:.3f} (Pearson)"
+                + (f" / {chi2_yates:.3f} (Yates)" if chi2_yates is not None
+                   else "")
+                + f", reported {reported_chi2}"
+            )
+
+    if reported_p is not None:
+        from .reported_stats import parse_reported_p, reported_p_verdict
+        # Accept a match against EITHER the uncorrected Pearson or the
+        # Yates-corrected p (SPSS default for 2x2); flag only if neither
+        # is consistent and decision-flip-free.  Routing through the shared
+        # machinery catches a significance flip the old ratio band missed
+        # (e.g. reported 0.03 vs a recomputed 0.081 — non-significant).
+        cmp_pearson = reported_p_verdict(p_calc, reported_p)
+        # UNDETERMINED = garbled reported p: cannot be judged, never flagged
+        cmp_ok = cmp_pearson['verdict'] in ('PASS', 'UNDETERMINED')
+        if p_yates is not None and not cmp_ok:
+            cmp_ok = reported_p_verdict(p_yates, reported_p)['verdict'] == 'PASS'
+        if not cmp_ok:
+            _, _, p_ref_str = parse_reported_p(reported_p)
+            flags.append(
+                f"p: calculated {p_calc:.2e}"
+                + (f" (Pearson) / {p_yates:.2e} (Yates)"
+                   if p_yates is not None else "")
+                + f", reported {cmp_pearson['reported_op']} {p_ref_str} "
+                + f"— {cmp_pearson['note']}"
+            )
+
+    result = {
+        'consistent': len(flags) == 0,
+        'chi2_calculated': round(chi2_calc, 4),
+        'chi2_yates': round(chi2_yates, 4) if chi2_yates is not None else None,
+        'chi2_matched': chi2_matched,
+        'p_calculated': p_calc,
+        'p_yates': p_yates,
+        'df': df,
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = (
+            f"FLAG: {label + ': ' if label else ''}{'; '.join(flags)}"
+        )
+    else:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"chi2({df}) = {chi2_calc:.3f}, p = {p_calc:.2e}"
+            + (f" (reported value matches the "
+               f"{'Yates-corrected' if chi2_matched == 'yates' else 'uncorrected Pearson'}"
+               f" statistic)" if chi2_matched else "")
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. SD/SE confusion detector
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_sd_se_confusion(
+    reported_sd: float, n: int, label: str = "",
+    known_range: Optional[Tuple[float, float]] = None,
+) -> dict:
+    """
+    Check whether a reported "SD" might actually be an SE (or vice versa).
+
+    If the reported SD seems implausibly small for the data range,
+    it may be an SE (SD / sqrt(n)). Conversely, an implausibly large
+    "SE" may be an SD.
+
+    Ref: Heathers (2025) ch. "Confusing SD and SE"
+
+    Args:
+        reported_sd: the value reported as SD
+        n: sample size
+        label: variable label
+        known_range: (min, max) of the variable if known
+    """
+    implied_se = reported_sd / math.sqrt(n)
+    implied_sd_from_se = reported_sd * math.sqrt(n)
+
+    flags = []
+
+    if known_range is not None:
+        data_range = known_range[1] - known_range[0]
+        # SD should be < range. If "SD" > range, suspicious.
+        if reported_sd > data_range:
+            flags.append(
+                f"reported SD ({reported_sd}) exceeds data range "
+                f"({data_range}) — may be mislabeled"
+            )
+        # If SD is very small relative to range and n is large,
+        # it might be an SE
+        if n > 10 and reported_sd < data_range * 0.05:
+            flags.append(
+                f"reported SD ({reported_sd}) is very small relative to "
+                f"range ({data_range}) — might be SE. "
+                f"If SE, true SD ~ {implied_sd_from_se:.2f}"
+            )
+
+    result = {
+        'reported_sd': reported_sd,
+        'n': n,
+        'implied_se_if_sd': round(implied_se, 4),
+        'implied_sd_if_se': round(implied_sd_from_se, 4),
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = (
+            f"FLAG: {label + ': ' if label else ''}{'; '.join(flags)}"
+        )
+    else:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"SD={reported_sd} (implies SE={implied_se:.4f} for n={n})"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. Quick SD check (SD vs range plausibility)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def quick_sd_check(
+    sd: Union[str, float], n: Optional[int], lo: float, hi: float,
+    label: str = "", dp_sd: Optional[int] = None
+) -> dict:
+    """
+    Heathers' 'quick SD check': is the reported SD plausible given the
+    possible range of the data?
+
+    For bounded data, the *population* SD <= range / 2 (half the points
+    at each extreme).  Reported SDs are *sample* SDs, whose (n-1)
+    denominator inflates the bound to range * sqrt(floor(n/2)*ceil(n/2)
+    / (n*(n-1))) — e.g. [0, 0, 10] has sample SD 5.774 > 5.  The n-aware
+    bound is used when n is known; the population bound only when n is
+    None.
+
+    The reported SD is itself rounded, so it is treated as a ±0.5-ulp
+    rounding interval: a value is branded impossible only when even its
+    lower edge (sd − 0.5·10^−dp_sd) exceeds the maximum.  This keeps a
+    genuine but heavily-bimodal SD like [1,1,7,7] → 3.4641 printed "3.5"
+    from being falsely stamped IMPOSSIBLE.
+
+    Also: for most real data, SD << range / 2 — an SD near the bound
+    means heavily bimodal data or outliers, which is flagged softly.
+
+    Args:
+        sd:    reported SD (string preserves trailing zeros for dp inference)
+        n:     sample size (enables the n-aware sample-SD bound)
+        lo, hi: known/assumed bounds of the measured variable
+        label: variable label
+        dp_sd: decimal places of the reported SD (inferred from the value
+               if None); sets the rounding tolerance to ±0.5 ulp
+
+    Ref: Heathers (2025) ch. "The 'quick' SD check"
+    """
+    if dp_sd is None:
+        dp_sd = _dp_from_str(sd if isinstance(sd, str) else f"{sd}")
+    sd = float(sd)
+    data_range = hi - lo
+    if n is not None and n >= 2:
+        # Max sample SD: floor(n/2) points at one extreme, ceil(n/2) at the
+        # other, (n-1) denominator.  For even n this is (range/2)*sqrt(n/(n-1));
+        # for odd n the even-split form overestimates (n=3 on [0,10]: true max
+        # is [0,0,10] -> 5.7735, not 6.1237)
+        k_lo = n // 2
+        k_hi = n - k_lo
+        max_possible_sd = data_range * math.sqrt(k_lo * k_hi / (n * (n - 1)))
+    else:
+        max_possible_sd = data_range / 2  # population bound (n unknown)
+
+    # More realistic upper bound: SD of a uniform distribution = range / sqrt(12)
+    uniform_sd = data_range / math.sqrt(12)
+
+    # The reported SD is rounded: compare its lower rounding edge against
+    # the maximum, so a value that merely rounds up to the bound is not
+    # branded impossible (cardinal rule — never accuse honest rounding).
+    half_ulp_sd = 0.5 * (10 ** -dp_sd)
+
+    flags = []
+    if sd - half_ulp_sd > max_possible_sd + 1e-9:
+        flags.append(
+            f"SD ({sd}) exceeds the maximum achievable SD "
+            f"({max_possible_sd:.2f}) for data confined to [{lo}, {hi}]"
+            f"{'' if n is None else f' at n={n}'} even allowing for rounding "
+            f"— IMPOSSIBLE (assumes values stay within the stated range)"
+        )
+    # Softer flag, not short-circuited by the impossible one
+    if sd > uniform_sd * 1.5:
+        flags.append(
+            f"SD ({sd}) exceeds 1.5x uniform SD ({uniform_sd:.2f}) "
+            f"— data must be heavily bimodal or contain outliers"
+        )
+
+    result = {
+        'sd': sd,
+        'data_range': data_range,
+        'max_possible_sd': round(max_possible_sd, 4),
+        'uniform_sd': round(uniform_sd, 4),
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = (
+            f"FLAG: {label + ': ' if label else ''}{'; '.join(flags)}"
+        )
+    else:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"SD={sd} within plausible range for [{lo}, {hi}]"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. Contingency table reconstruction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_contingency_table(
+    row_totals: List[int],
+    col_totals: List[int],
+    reported_total: Optional[int] = None,
+    label: str = "",
+) -> dict:
+    """
+    Check whether reported row and column marginal totals of a
+    contingency table are internally consistent.
+
+    Ref: Heathers (2025) ch. "Reconstructing contingency tables"
+    """
+    row_sum = sum(row_totals)
+    col_sum = sum(col_totals)
+
+    flags = []
+    if row_sum != col_sum:
+        flags.append(
+            f"Row totals sum to {row_sum}, column totals sum to {col_sum} "
+            f"— must be equal"
+        )
+
+    if reported_total is not None:
+        if row_sum != reported_total:
+            flags.append(
+                f"Row totals sum to {row_sum}, reported N = {reported_total}"
+            )
+        if col_sum != reported_total:
+            flags.append(
+                f"Column totals sum to {col_sum}, reported N = {reported_total}"
+            )
+
+    result = {
+        'consistent': len(flags) == 0,
+        'row_sum': row_sum,
+        'col_sum': col_sum,
+        'reported_total': reported_total,
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = (
+            f"FAIL: {label + ': ' if label else ''}{'; '.join(flags)}"
+        )
+    else:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"marginals consistent (N={row_sum})"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. Frozen SDs (constant variance across timepoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_frozen_sds(
+    sds: List[List[float]],
+    labels: Optional[List[str]] = None,
+    group_labels: Optional[List[str]] = None,
+) -> dict:
+    """
+    Check whether SDs are suspiciously constant across timepoints.
+
+    In real longitudinal data, standard deviations naturally fluctuate
+    across measurement occasions due to dropout, treatment effects,
+    regression to the mean, and measurement noise.  Perfectly constant
+    SDs across 3+ timepoints for many variables is a hallmark of
+    fabricated data.
+
+    Args:
+        sds: list of SD series, each a list of SDs across timepoints
+             for one variable/group combination.
+             E.g., [[2.97, 2.97, 3.02], [3.20, 3.20, 3.20], ...]
+        labels: optional label for each SD series
+        group_labels: optional labels for timepoints (e.g., ["Baseline", "Week 6", "Week 12"])
+
+    Returns:
+        dict with 'n_frozen', 'n_total', 'frozen_fraction',
+        'frozen_series' (which ones are frozen), and 'detail'.
+    """
+    if labels is None:
+        labels = [f"series_{i}" for i in range(len(sds))]
+
+    frozen = []
+    for sd_series, label in zip(sds, labels):
+        if len(sd_series) >= 2 and len(set(sd_series)) == 1:
+            frozen.append(label)
+
+    n_frozen = len(frozen)
+    n_total = len(sds)
+    frac = n_frozen / n_total if n_total > 0 else 0
+
+    flags = []
+    if frac > 0.5:
+        flags.append(
+            f"{n_frozen}/{n_total} ({frac:.0%}) SD series are perfectly "
+            f"constant across all timepoints"
+        )
+    if n_frozen >= 5:
+        flags.append(
+            "5+ frozen SD series is extremely unlikely in real "
+            "longitudinal data"
+        )
+
+    result = {
+        'n_frozen': n_frozen,
+        'n_total': n_total,
+        'frozen_fraction': round(frac, 4),
+        'frozen_series': frozen,
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = f"FLAG: {'; '.join(flags)}"
+    else:
+        result['detail'] = (
+            f"PASS: {n_frozen}/{n_total} SD series are constant "
+            f"({frac:.0%}) — within normal range"
+        )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. Carlisle-Stouffer-Fisher test (Table 1 baseline p-values)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def carlisle_stouffer_fisher(
+    p_values: Union[List[float], List[Tuple[float, str]]],
+    label: str = "",
+) -> Union[dict, List[dict]]:
+    """
+    Test whether a set of baseline comparison p-values (typically from
+    Table 1 of an RCT) are suspiciously well-balanced.
+
+    In a properly randomized trial, baseline p-values should be
+    uniformly distributed on [0, 1]. If they cluster too high
+    (everything is perfectly balanced), the randomization may be
+    fabricated.
+
+    Three complementary combinations are reported (hence the name):
+      - Stouffer: Z = sum(Phi_inv(1 - p_i)) / sqrt(k) — two-sided, flags
+        clustering high (too balanced) or low (too unbalanced);
+      - Fisher: X^2 = -2*sum(ln p_i) ~ chi^2(2k) — one-sided, flags
+        p-values clustering near 0 (genuinely unbalanced baselines);
+      - Kolmogorov-Smirnov against U(0, 1) — flags non-uniformity.
+    Each reported p is treated as a rounding interval and clamped away
+    from the 0/1 boundaries before Phi_inv/ln, so "p = 1.00" (ordinary
+    rounding) never produces an inf/NaN or a deterministic false flag.
+
+    **Important:** Categorical and continuous baseline variables should
+    be tested separately, because they have different distributional
+    properties. Pooling them can mask a real signal in one stratum.
+
+    Args:
+        p_values: Either:
+            - List[float]: plain p-values (backward compatible)
+            - List[Tuple[float, str]]: typed p-values where str is
+              "categorical" or "continuous".  When types are mixed,
+              the function auto-splits and returns a list of results
+              (one per type, plus a combined result).
+        label: optional label
+
+    Returns:
+        dict (single result) when all p-values are the same type or
+        untyped.  list[dict] when mixed types trigger auto-split —
+        each dict has 'variable_type' key.
+
+    Ref: Carlisle (2017) doi:10.1111/anae.13938
+    Ref: Heathers (2025) ch. "Analyzing multiple Table 1 p-values"
+    Ref: Meyerowitz-Katz — split by type.
+    """
+    # Detect typed input and auto-split if needed
+    if p_values and isinstance(p_values[0], (tuple, list)):
+        types_seen = set(t for _, t in p_values)
+        if len(types_seen) > 1:
+            results = []
+            for vtype in sorted(types_seen):
+                sub = [p for p, t in p_values if t == vtype]
+                sub_label = f"{label} ({vtype})" if label else vtype
+                r = carlisle_stouffer_fisher(sub, label=sub_label)
+                r['variable_type'] = vtype
+                results.append(r)
+            # Also run combined for reference
+            all_p = [p for p, _ in p_values]
+            combined_label = f"{label} (combined)" if label else "combined"
+            r_all = carlisle_stouffer_fisher(all_p, label=combined_label)
+            r_all['variable_type'] = 'combined'
+            r_all['_note'] = (
+                'Combined result — interpret with caution. '
+                'Categorical and continuous variables were also '
+                'tested separately (see other results).'
+            )
+            results.append(r_all)
+            return results
+        else:
+            # All same type — unwrap and run normally
+            p_values = [p for p, _ in p_values]
+    k = len(p_values)
+    if k < 3:
+        return {
+            'sufficient_data': False,
+            'detail': f"SKIP: need >= 3 p-values for Carlisle test (got {k})"
+        }
+
+    # Reported p-values are rounded, so a printed "1.00" or "0.00" is a
+    # rounding interval, not the exact boundary.  Clamp each p into
+    # [ulp/2, 1 − ulp/2] at its printed precision before any Phi_inv / ln,
+    # so the boundary values can never produce ±inf (Stouffer) or NaN
+    # (a 1.0 and a 0.0 together) — the cardinal rule: ordinary rounding of
+    # "p = 1.00" must never manufacture a deterministic flag or a silence.
+    def _clamped(p):
+        # _p_half_ulp understands scientific notation ('1e-05') and bare
+        # integers ('1'/'0'); the old _dp_from_str read both as 0 dp,
+        # collapsing such p-values to 0.5 (a silent false PASS).
+        half = _p_half_ulp(p)
+        return min(max(float(p), half), 1.0 - half)
+
+    p_floats = [float(p) for p in p_values]
+    p_clamped = [_clamped(p) for p in p_values]
+
+    # Stouffer's method: convert p-values to z-scores and combine.
+    # With z_i = Phi_inv(1 - p_i), HIGH p-values give NEGATIVE z-scores:
+    # combined Z << 0 means the p-values cluster high (too well-balanced,
+    # Carlisle's fabrication signature) and combined Z >> 0 means they
+    # cluster low (genuinely unbalanced baselines).
+    z_scores = [float(sp.norm.ppf(1 - p)) for p in p_clamped]
+    combined_z = sum(z_scores) / math.sqrt(k)
+
+    # Two-tailed: suspicious in either direction
+    p_combined = float(sp.norm.sf(abs(combined_z)) * 2)
+
+    # Fisher's combined-probability method (the "Fisher" the name claims):
+    # X^2 = -2 * sum(ln p_i) ~ chi^2 with 2k df.  It is one-sided —
+    # sensitive to p-values clustering near 0 (too many "significant"
+    # baseline differences, i.e. genuinely unbalanced).  Uses the clamped
+    # p-values so a reported 0.00 cannot send a term to +inf.
+    fisher_x2 = -2.0 * sum(math.log(p) for p in p_clamped)
+    p_fisher = float(sp.chi2.sf(fisher_x2, 2 * k))
+
+    # Also check: are p-values suspiciously uniform?
+    # Kolmogorov-Smirnov test against U(0,1)
+    ks_stat, ks_p = sp.kstest(p_floats, 'uniform')
+
+    # Are p-values too high? (suspiciously good balance)
+    mean_p = sum(p_floats) / k
+    median_p = sorted(p_floats)[k // 2]
+
+    flags = []
+    if p_combined < 0.05 and combined_z < 0:
+        flags.append(
+            f"Stouffer combined Z = {combined_z:.3f} (p = {p_combined:.4f}) — "
+            f"baseline variables are suspiciously well-balanced"
+        )
+    if p_combined < 0.05 and combined_z > 0:
+        flags.append(
+            f"Stouffer combined Z = {combined_z:.3f} (p = {p_combined:.4f}) — "
+            f"baseline variables are suspiciously unbalanced"
+        )
+    if p_fisher < 0.05:
+        flags.append(
+            f"Fisher combined X^2 = {fisher_x2:.3f} (p = {p_fisher:.4f}) — "
+            f"p-values cluster near 0 (suspiciously unbalanced baselines)"
+        )
+    if ks_p < 0.05:
+        flags.append(
+            f"KS test: p-values are not uniformly distributed "
+            f"(D = {ks_stat:.3f}, p = {ks_p:.4f})"
+        )
+
+    result = {
+        'suspicious': len(flags) > 0,
+        'combined_z': round(combined_z, 4),
+        'p_combined_stouffer': round(p_combined, 6),
+        'fisher_x2': round(fisher_x2, 4),
+        'p_combined_fisher': round(p_fisher, 6),
+        'ks_statistic': round(float(ks_stat), 4),
+        'ks_p_value': round(float(ks_p), 6),
+        'mean_p': round(mean_p, 4),
+        'median_p': round(median_p, 4),
+        'n_pvalues': k,
+        'flags': flags,
+    }
+    if flags:
+        result['detail'] = (
+            f"FLAG: {label + ': ' if label else ''}{'; '.join(flags)}"
+        )
+    else:
+        result['detail'] = (
+            f"PASS: {label + ': ' if label else ''}"
+            f"Table 1 p-values appear consistent with randomization "
+            f"(Stouffer Z = {combined_z:.3f}, p = {p_combined:.4f}; "
+            f"mean p = {mean_p:.3f})"
+        )
+    return result
+

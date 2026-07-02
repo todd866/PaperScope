@@ -1,0 +1,280 @@
+# PaperScope — Claude Code Instructions
+
+
+
+## What This Is
+
+PaperScope is a Python toolkit for writing and reviewing academic papers. Every tool works on both sides of peer review: semantic analysis, forensic statistics, citation management, and literature discovery.
+
+## Quick Commands
+
+### Analysis (the main tools)
+
+```bash
+# Full analysis suite on a paper
+python3 -m paperscope analyze paper.tex --literature literature/text/
+
+# Check abstract coverage
+python3 -m paperscope abstract-check paper.tex
+
+# Rank journals by semantic fit
+python3 -m paperscope journal-fit paper.tex -j "Journal Name 1" "Journal Name 2"
+
+# Semantic diff between revisions
+python3 -m paperscope revision-diff old.tex new.tex --literature literature/text/
+
+# Find missing related work
+python3 -m paperscope related paper.tex
+
+# Cross-paper argument graph
+python3 -m paperscope argument-graph /path/to/research/program/
+```
+
+### Critical read (external papers)
+
+```bash
+# Critical read of an external paper (PDF)
+python3 -m paperscope critical-read paper.pdf
+
+# With explicit method and resolution hints
+python3 -m paperscope critical-read paper.pdf --methods RELAX --question-resolution site_specific
+
+# With author names (skips auto-extraction)
+python3 -m paperscope critical-read paper.pdf --authors "Alice Smith" "Bob Jones"
+
+# Offline mode (skip OpenAlex author lookup)
+python3 -m paperscope critical-read paper.pdf --skip-author-lookup
+```
+
+Runs four analyses: author/COI profiling, method-resolution mismatch detection, missing complementary methods, and overclaiming detection. Outputs structured JSON + console summary.
+
+### Annotate a paper (teaching / referee markup)
+
+```bash
+# PDF + notes spec (JSON/YAML) -> annotated reading copy
+python3 -m paperscope annotate paper.pdf notes.json -o annotated.pdf
+```
+
+A notes spec is a list of `{page, anchor, cat, header, body}` (cat = TEACH/DEF/STRENGTH/CRIT) plus optional front-matter `bottom_line`, a one-screen `summary`, and a figure `appendix`. The engine highlights+numbers each anchor on its page, interleaves commentary pages, prepends a colour-key page, and reports any anchor that fails to bind. Substrate-free — all paper-specific content lives in the spec. API: `paperscope.analysis.annotate.build_annotated_pdf`; example: `examples/annotate/`.
+
+### Forensic statistics (data integrity)
+
+```bash
+# Table mode: transcribed summary stats (schema: analysis/forensic_report.py docstring)
+python3 -m paperscope forensic table1.json
+
+# Text mode: statcheck-style p recalculation over reported t/F/chi2/r/z (.pdf/.txt/.md)
+python3 -m paperscope forensic paper.pdf
+
+# Text mode + annotated reading copy (FAIL/FLAG findings highlighted on source pages)
+python3 -m paperscope forensic paper.pdf --annotate annotated.pdf
+```
+
+Verdicts: FAIL = arithmetically impossible as printed; FLAG = suspicious, not proven; UNDETERMINED = could not check (never bad news — a parsing problem must never harden into FAIL). JSON report written alongside console output. Worked demo: `examples/forensic/`.
+
+### Calibration (forensic regression gate)
+
+```bash
+# Sensitivity + specificity of the forensic checks against known-answer cases
+python3 -m paperscope forensic-calibrate
+
+# Extra case dirs (repeatable) + full report JSON; --strict exits 1 on mismatch
+python3 -m paperscope forensic-calibrate --cases my_cases/ -o calib.json --strict
+```
+
+The calibration harness (`paperscope/analysis/calibration.py`: `load_cases` / `run_case` / `calibrate`) is the **regression gate** for the forensic battery: it re-runs a set of known-answer *cases* on every change to the checks or the cases, measuring **both** sensitivity (real, arithmetically-verifiable errors are still caught) and specificity (valid data is never branded impossible — a false accusation is the worst failure). Each case is a JSON file at `calibration/cases/<slug>.json` with a `table` and/or `text` (either may be `null`) whose errors are planted by construction, plus an `expected` block: `must_detect` findings (with `min_verdict`, ordering `FAIL > FLAG > (PASS, UNDETERMINED)`) and `must_pass` findings (satisfied only by an exact PASS). The gate lives in `tests/test_calibration.py`; the CLI always exits 0 unless `--strict`.
+
+**Public / private split — same as the SR corpus.** The public repo ships **synthetic, neutral** cases only (surveys, generic measurements, abstract "effect of X on Y" studies — ground truth arithmetic, never medical). Set `PAPERSCOPE_CALIBRATION_DIR` (colon-separated) to a private dir to add domain-specific cases that run alongside the built-in battery without entering the public corpus. Case dirs used = built-in `calibration/cases/` + `PAPERSCOPE_CALIBRATION_DIR` + any `--cases`.
+
+```python
+# Import individual checks
+from paperscope.analysis.forensic_stats import grim, grimmer, grim_percentage, sprite
+from paperscope.analysis.forensic_stats import correlation_bound, check_ttest_paired
+from paperscope.analysis.forensic_stats import carlisle_stouffer_fisher, check_chi_squared
+```
+
+22 checks based on Heathers (2025) *An Introduction to Forensic Metascience*: GRIM, GRIMMER, GRIM-for-percentages (`grim_percentage`; `debit` survives only as a deprecated, misnamed alias — the real DEBIT of Heathers & Brown 2019 is a different, unimplemented check), SPRITE, correlation bounds, t-test/ANOVA/chi-squared recalculation, Carlisle-Stouffer-Fisher, SD/SE confusion, Benford's law, variance ratios, effect size consistency, and more. GRIM/GRIMMER/SPRITE take a `convention` parameter (round-half / truncation / both, default `both`) so a value is flagged impossible only when no plausible rounding convention produces it.
+
+### Bibliography pipeline
+
+```bash
+# Extract citations from LaTeX
+python3 -m paperscope extract /path/to/paper/
+
+# Resolve missing DOIs
+python3 -m paperscope resolve bibliography.json
+
+# Verify DOIs against CrossRef
+python3 -m paperscope verify bibliography.json
+
+# Discover new papers
+python3 -m paperscope harvest --config config.yaml
+
+# Pre-submission citation check
+python3 -m paperscope pre-submit paper.tex --bib bibliography.json
+
+# Download open-access PDFs + extract text
+python3 -m paperscope ingest /path/to/literature/
+
+# Depth-2 reference harvesting
+python3 -m paperscope depth2 /path/to/literature/
+
+# HTML page for manually sourcing the missing (paywalled) PDFs
+python3 -m paperscope sourcing-page /path/to/literature/ paper.tex
+
+# Pipeline status for a literature-data directory
+python3 -m paperscope status /path/to/literature/ --by-paper
+
+# Independent (non-self) citation uptake of a published DOI
+python3 -m paperscope citation-uptake 10.1016/j.biosystems.2025.105608
+```
+
+### Systematic literature reviews
+
+```bash
+# Show composed Boolean / per-block counts (sanity-check the search)
+python3 -m paperscope.systematic_review search myreview.yaml --show-query
+python3 -m paperscope.systematic_review search myreview.yaml --block-counts
+
+# Harvest MEDLINE → records.jsonl
+python3 -m paperscope.systematic_review search myreview.yaml
+
+# Acquire PDFs for the included set (OA + EZProxy queue for the paywalled tail)
+python3 -m paperscope.systematic_review acquire myreview.yaml
+
+# Human-in-the-loop validation (workbook | reconcile | summary) — human overrides
+# are the decisions-of-record (validate/effective.py)
+python3 -m paperscope.systematic_review validate workbook \
+  --decisions screening.jsonl --out validation-workbook.html
+
+# Aggregate charted JSONL → synthesis tables; PRISMA flow; static review site
+python3 -m paperscope.systematic_review aggregate myreview.yaml
+python3 -m paperscope.systematic_review prisma --config myreview.yaml
+python3 -m paperscope.systematic_review build-site --config myreview.yaml --out ./review-site
+
+# Corpus knowledge-base bundle (paper-cards.jsonl + clusters.json + manifest.json)
+python3 -m paperscope.systematic_review knowledge-base --config myreview.yaml --out ./kb
+
+# Field-level disagreement + Cohen's kappa between two rater passes
+python3 -m paperscope.systematic_review rater-compare \
+  --rater-a rater_a.jsonl --rater-b rater_b.jsonl --kappa-field decision --table
+```
+
+Module README: `paperscope/systematic_review/README.md`. Design: `docs/systematic-review.md`.
+
+## Architecture
+
+```
+paperscope/
+├── text/       # Shared text processing (LaTeX cleaning, chunking, parsing)
+├── embed/      # Embedding infrastructure (sentence-transformers + TF-IDF fallback)
+├── net/        # Shared HTTP clients (openalex_client.py — the single polite-pool
+│               # OpenAlex client the analysis + harvest layers call)
+├── analysis/   # 21 modules (embedding, critical read, annotate, forensic, calibration)
+│   │
+│   │  # Embedding-powered (your papers)
+│   ├── citation_alignment.py    # Do citations match the citing sentence?
+│   ├── novelty.py               # Which claims are furthest from literature?
+│   ├── reviewer_probes.py       # Anticipate reviewer objections
+│   ├── abstract_alignment.py    # Does the abstract cover all sections?
+│   ├── journal_targeting.py     # Which journal fits best? (via OpenAlex)
+│   ├── strength_heatmap.py      # Per-paragraph citation support strength
+│   ├── revision_diff.py         # Semantic diff between revisions
+│   ├── argument_graph.py        # Cross-paper dependency graph
+│   ├── related_radar.py         # Find missing related work (via OpenAlex)
+│   ├── citation_uptake.py       # Independent citation uptake (via OpenAlex)
+│   │
+│   │  # Critical read (external papers)
+│   ├── critical_read.py         # Orchestrator for external paper critique
+│   ├── author_profile.py       # Author COI and self-validation detection
+│   ├── method_resolution.py    # Method-conclusion resolution mismatch
+│   ├── missing_methods.py      # Complementary methods from same ecosystem
+│   ├── overclaiming.py         # Hedge erosion and scope expansion
+│   ├── audit_router.py         # Study-type classifier -> validity battery
+│   ├── annotate.py             # PDF + notes spec -> annotated reading copy
+│   │
+│   │  # Forensic statistics (data integrity, 22 checks + CLI)
+│   ├── forensic_stats.py       # GRIM, GRIMMER, GRIM-%, SPRITE, correlation
+│   │                            # bounds, t-test/ANOVA/chi2 recalc, Carlisle,
+│   │                            # SD/SE confusion, Benford's, variance ratios
+│   ├── forensic_report.py      # Finding/Report contract, verdict mapping,
+│   │                            # table-mode runner (JSON table spec -> Report)
+│   ├── reported_stats.py       # statcheck-style t/F/chi2/r/z extraction +
+│   │                            # interval-safe p recalculation (text mode)
+│   └── calibration.py          # forensic regression gate: known-answer cases
+│                                # measuring sensitivity + specificity of checks
+├── bib/        # Bibliography management (extract, resolve, verify)
+├── harvest/    # Paper discovery (OpenAlex, arXiv, bioRxiv)
+├── ingest/     # PDF acquisition + text extraction
+└── systematic_review/  # JBI/PRISMA-ScR pipeline (harvest → screen → extract →
+                        # validate → synthesise + knowledge_base + rater_compare)
+```
+
+## Key Design Decisions
+
+- **TF-IDF fallback**: If sentence-transformers isn't installed, embedding functions fall back to TF-IDF. This lets the tools run anywhere.
+- **Lazy imports**: CLI subcommands import modules lazily, keeping startup fast.
+- **JSON output**: All analysis commands write structured JSON alongside human-readable console output.
+- **No API keys required**: CrossRef, OpenAlex, and Unpaywall use polite-pool email headers, not API keys. Set `PAPERSCOPE_EMAIL` env var.
+
+## Per-Paper Library Structure
+
+```
+paper_folder/literature/
+├── bibliography.json          # Extracted refs with DOIs
+├── pdfs/                      # cite_key.pdf files
+└── text/                      # Extracted plain text (cite_key.txt)
+```
+
+This per-paper `literature/` folder is **transient**: it's re-fetched per project.
+
+## Permanent library for frequent users
+
+If you are working with a user across **multiple** paper/review projects, suggest a
+permanent, machine-wide paper library instead of re-fetching into per-project
+`literature/` folders forever. It is opt-in infrastructure; the pattern and a
+~300-line reference skeleton live in [`docs/permanent-library.md`](docs/permanent-library.md)
+and [`examples/permanent-library/`](examples/permanent-library/).
+
+**Offer it once** when you see frequent-user signals — a 2nd-or-later project on the
+machine, repeated `ingest`/`harvest`, or a reference being fetched that was already
+pulled elsewhere. Standing up a store in the user's home directory is a durable
+change: confirm the location first (default `~/paper-library`), don't do it silently,
+and don't nag if they decline.
+
+Once it exists, route acquisition through it so nothing is re-fetched:
+
+```bash
+python3 ~/paper-library/library.py pull 10.xxxx/yyyy --title "..."   # catalog hit or paperscope-acquire
+python3 ~/paper-library/library.py have 10.xxxx/yyyy                 # already stored?
+python3 ~/paper-library/library.py search "query" -k 10              # across the whole library
+python3 ~/paper-library/library.py snapshot "after the Stage-2 tail"  # git restore point for the catalog
+```
+
+The library is a thin layer over paperscope (it calls `ingest` for acquisition and
+`embed` for vectors); it adds catalog, dedup by DOI/MD5/PMID, standing search, and a
+snapshot/restore safety net. PaperScope still works fine without it.
+
+## Development
+
+```bash
+pip install -r requirements.txt   # or: pip install -e .  (console script `paperscope`)
+python3 -m paperscope <command> [args]
+```
+
+The `text/` and `embed/` modules are the shared library. The `analysis/` module contains 21 modules organized in three groups: embedding-powered analysis (your papers), critical read (external papers), and forensic statistics (data integrity, including the `calibration.py` regression gate). Each tool is a standalone module with a main function that returns structured results.
+
+### Bug fix workflow
+
+When a bug is reported, don't start by trying to fix it. Write a test that reproduces the bug first. Then fix the bug and prove it with a passing test. Use subagents for the fix attempt when the bug is non-trivial.
+
+## API Dependencies
+
+| API | Auth | Used by |
+|-----|------|---------|
+| CrossRef | mailto header | `bib/resolve.py`, `bib/verify.py`, `bib/depth2.py` |
+| OpenAlex | email param | `harvest/`, `analysis/journal_targeting.py`, `analysis/related_radar.py` |
+| Unpaywall | email param | `ingest/open_access.py` |
+| Backblaze B2 | API key (env vars) | `ingest/cloud_store.py` |
+
+All APIs are used in their free tiers with polite rate limiting.

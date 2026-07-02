@@ -1,0 +1,14 @@
+{
+  "name": "paperscope",
+  "version": "1.1.0",
+  "description": "Toolkit for writing and reviewing academic papers. Semantic analysis, forensic statistics (22 data-integrity checks), critical read, and bibliography management.",
+  "author": {
+    "name": "Ian Todd",
+    "email": "ian@coherencedynamics.com"
+  },
+  "homepage": "https://github.com/todd866/PaperScope",
+  "repository": "https://github.com/todd866/PaperScope",
+  "license": "MIT",
+  "keywords": ["academic", "papers", "citations", "latex", "embedding", "analysis"],
+  "skills": "./skills/"
+}

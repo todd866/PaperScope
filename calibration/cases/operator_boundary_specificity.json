@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "label": "Specificity guard: reported-p operators, boundary p=1.00, and integer-reported change arithmetic must all PASS",
+    "source": "synthetic",
+    "ground_truth": "synthetic: correct-by-construction. (1) A between-group difference of 10.0 vs 13.0 (SD 2.0, n=50 each) recomputes to p ~ 3e-11, entirely consistent with a reported '<0.001' — the operator must be honoured, not read as an exact equality. (2) Four baseline p-values including a perfectly-balanced p=1.00 are consistent with randomization (Carlisle must clamp the boundary, never manufacture an inf/NaN or a deterministic flag). (3) An integer-reported change row 26 -> 12 with reported change -15 is consistent within display rounding (true 26.4/11.6/-14.8): End - Baseline = -14 differs from -15 by 1.0, inside the dp-aware tolerance 1.5*10^0.",
+    "notes": "Neutral, non-biological. A pure specificity case — nothing here is an error, so nothing may be flagged. It locks in three anti-false-accusation fixes at once: bug-5 (string reported_p '<0.001' routed through the shared reported_p_verdict machinery, operator honoured), bug-6 (Carlisle clamps a reported p=1.00 rather than sending Phi_inv to -inf), and bug-2 (dp-aware change-arithmetic tolerance passes an integer-reported row the old fixed 0.15 tolerance falsely FAILed). No granularity is declared on the baseline variables, so GRIM is correctly skipped as UNDETERMINED rather than assuming integer granularity on continuous measures."
+  },
+  "table": {
+    "meta": {"paper": "Correctly reported operators and boundaries (SYNTHETIC control)", "table": "Tables 1-2."},
+    "variables": [
+      {"name": "Baseline A", "groups": [{"name": "all", "n": 40, "mean": "10.0"}], "baseline_p": 1.00},
+      {"name": "Baseline B", "groups": [{"name": "all", "n": 40, "mean": "11.0"}], "baseline_p": 0.50},
+      {"name": "Baseline C", "groups": [{"name": "all", "n": 40, "mean": "12.0"}], "baseline_p": 0.30},
+      {"name": "Baseline D", "groups": [{"name": "all", "n": 40, "mean": "13.0"}], "baseline_p": 0.70}
+    ],
+    "tests": [
+      {"type": "ttest_independent", "target": "primary outcome",
+       "mean1": 10.0, "sd1": 2.0, "n1": 50,
+       "mean2": 13.0, "sd2": 2.0, "n2": 50, "reported_p": "<0.001"}
+    ],
+    "changes": [
+      {"name": "weight change", "baseline": 26, "end": 12, "reported_change": -15}
+    ]
+  },
+  "text": null,
+  "expected": {
+    "must_detect": [],
+    "must_pass": [
+      {"check": "check_ttest_independent", "target_contains": "primary outcome"},
+      {"check": "carlisle_stouffer_fisher", "target_contains": "baseline p-values"},
+      {"check": "check_change_arithmetic", "target_contains": "weight change"}
+    ]
+  }
+}
