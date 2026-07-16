@@ -26,7 +26,7 @@ PaperScope is a Python toolkit for working with academic papers at both manuscri
 The core premise is that paper-level evaluation and corpus-level evaluation are inseparable. A paper is only meaningful relative to the literature it claims to extend, cite, contradict, ignore, or compress. PaperScope therefore treats "evaluate this paper" as a local view into "evaluate this corpus": citation checks, novelty, method resolution, overclaiming, forensic flags, and review synthesis all depend on knowing what the surrounding corpus looks like.
 
 - **Semantic analysis** — embeds a manuscript and its literature into a shared vector space to catch citation misalignment, unsupported claims, abstract gaps, and missing related work
-- **Forensic statistics** — 19 data-integrity checks (GRIM, GRIMMER, SPRITE, correlation bounds, p-value recalculation, Carlisle test, and more) based on Heathers (2025) [*An Introduction to Forensic Metascience*](https://jamesheathers.curve.space/)
+- **Forensic statistics** — 22 data-integrity checks (GRIM, GRIMMER, SPRITE, correlation bounds, p-value recalculation, Carlisle test, and more) based on Heathers (2025) [*An Introduction to Forensic Metascience*](https://jamesheathers.curve.space/)
 - **Critical read** — author profiling, method-resolution mismatch detection, overclaiming analysis
 - **Bibliography pipeline** — citation extraction, DOI resolution, retraction detection, literature discovery
 - **Systematic literature reviews** — JBI / PRISMA-ScR rails (harvest → screen → extract → validate → synthesise) for scoping reviews where **your AI assistant is the screening/extraction engine**. There is no bundled classifier: `screen` and `extract` are SDK-agnostic seams (interface + abstaining stub) designed to be driven by the assistant you already use — Claude Code, Codex — through the CLI and JSONL contracts; the pipeline supplies the rails, the append-only audit trail, the human-adjudication queue, and a static-HTML review site. Reviews are protocol-as-data: one YAML defines PCC, search query blocks, screening rubric, charting schema, and aggregation rules. The `validate` step turns AI screening/extraction decisions into a human work queue (the model self-flags its low-confidence calls; the human adjudicates only those; flips reconcile back append-only) — see [`docs/validate.md`](docs/validate.md). See also [`paperscope/systematic_review/`](paperscope/systematic_review/) and [`docs/systematic-review.md`](docs/systematic-review.md).
@@ -235,8 +235,8 @@ clinical source-type explanations. Sidebar prose resolves citation markers, cite
 keys, and author-year labels back into the same reference panel; optional
 `native_href` and `source_href` fields add panel actions without making citation
 clicks launch a new tab directly.
-LocalEvidence calls the same generator in medical mode rather than maintaining a
-separate paper-reader fork.
+LocalEvidence is intended to call the same generator in medical mode rather than
+maintain a separate paper-reader fork.
 
 ### Permanent library (frequent users)
 
@@ -340,7 +340,7 @@ Corpus knowledge-base roadmap: [`docs/corpus-knowledge-base.md`](docs/corpus-kno
 
 **Forensic statistics** (data integrity):
 1. Reviewer transcribes summary statistics from paper tables
-2. 19 automated checks test internal consistency
+2. 22 automated checks test internal consistency
 3. Results classified as pass, flag (suspicious), or fail (impossible)
 
 The [paper (PDF)](paper/paperscope.pdf) (March 2026) describes the embedding-analysis core; the forensic-statistics and systematic-review modules postdate it. For those, Heathers (2025) is the forensic reference and [`docs/systematic-review.md`](docs/systematic-review.md) is the design document.

@@ -47,8 +47,8 @@ python3 -m paperscope forensic table1.json
 python3 -m paperscope forensic paper.pdf
 python3 -m paperscope forensic paper.pdf --annotate annotated.pdf
 
-# Forensic statistics demo (built-in example)
-python3 -m paperscope.analysis.forensic_stats
+# Worked forensic example (ships with the repo)
+python3 -m paperscope forensic examples/forensic/table1.json
 ```
 
 ## Forensic statistics
